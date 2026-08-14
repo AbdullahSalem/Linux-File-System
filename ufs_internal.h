@@ -82,37 +82,23 @@ struct ufs_inode
     int64_t created_at;
     int64_t modified_at;
 
-    uint32_t data_blocks;
+    uint32_t block_count;
 
-    union
-    {
-        /* ================= DIRECTORY ================= */
+    /*
+     * Data block pointers.
+     *
+     * For files:
+     *     blocks contain file data.
+     *
+     * For directories:
+     *     blocks contain directory entries.
+     */
+    uint32_t direct_blocks[10];
 
-        struct
-        {
-            uint32_t children[44];
-            uint32_t child_count;
-        } directory;
-
-
-        /* ================= FILE ================= */
-
-        struct
-        {
-            uint32_t direct_blocks[10];
-
-            uint32_t indirect_block;
-
-            uint32_t double_indirect_block;
-
-            uint32_t triple_indirect_block;
-
-            uint32_t block_count;
-        } file;
-
-    } data;
+    uint32_t indirect_block;
+    uint32_t double_indirect_block;
+    uint32_t triple_indirect_block;
 };
-
 
 /*
  * Make sure the on-disk structures have
