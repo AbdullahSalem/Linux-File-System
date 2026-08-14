@@ -9,7 +9,8 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
-
+#include <fcntl.h>
+#include <stdint.h>
 
 /* =========================================================
  * Global Filesystem State
@@ -45,7 +46,6 @@ static void bitmap_set(uint8_t *bitmap, uint64_t index)
         (uint8_t)(1u << (index % 8));
 }
 
-
 /*
  * Clear a bit to 0.
  */
@@ -54,7 +54,6 @@ static void bitmap_clear(uint8_t *bitmap, uint64_t index)
     bitmap[index / 8] &=
         (uint8_t)~(1u << (index % 8));
 }
-
 
 /*
  * Check whether a bit is set.
@@ -67,9 +66,9 @@ static int bitmap_test(const uint8_t *bitmap,
                        uint64_t index)
 {
     return (bitmap[index / 8] >>
-            (index % 8)) & 1u;
+            (index % 8)) &
+           1u;
 }
-
 
 /*
  * Calculate how many bitmap blocks
@@ -77,11 +76,8 @@ static int bitmap_test(const uint8_t *bitmap,
  */
 static uint64_t bitmap_blocks_needed(uint64_t count)
 {
-    return
-        (count + UFS_BITS_PER_BITMAP_BLOCK - 1)
-        / UFS_BITS_PER_BITMAP_BLOCK;
+    return (count + UFS_BITS_PER_BITMAP_BLOCK - 1) / UFS_BITS_PER_BITMAP_BLOCK;
 }
-
 
 /*
  * Find the first free bit.
@@ -103,7 +99,6 @@ static int64_t bitmap_find_free(const uint8_t *bitmap,
 
     return -1;
 }
-
 
 /* =========================================================
  * Low Level Disk I/O
@@ -133,7 +128,6 @@ static int disk_read_block(uint64_t block_num, void *buf)
 
     return 0;
 }
-
 
 /*
  * Write a single UFS_BLOCK_SIZE block to the mounted image.
@@ -165,7 +159,6 @@ static int disk_write_block(uint64_t block_num, const void *buf)
     return 0;
 }
 
-
 /*
  * Persist the in-RAM inode bitmap back to disk.
  */
@@ -174,7 +167,7 @@ static int flush_inode_bitmap(void)
     for (uint32_t i = 0; i < sb.inode_bitmap_blocks; i++)
     {
         if (disk_write_block(sb.inode_bitmap_start + i,
-                              inode_bitmap + (size_t)i * UFS_BLOCK_SIZE) != 0)
+                             inode_bitmap + (size_t)i * UFS_BLOCK_SIZE) != 0)
         {
             return -1;
         }
@@ -182,7 +175,6 @@ static int flush_inode_bitmap(void)
 
     return 0;
 }
-
 
 /*
  * Persist the in-RAM block bitmap back to disk.
@@ -192,7 +184,7 @@ static int flush_block_bitmap(void)
     for (uint32_t i = 0; i < sb.block_bitmap_blocks; i++)
     {
         if (disk_write_block(sb.block_bitmap_start + i,
-                              block_bitmap + (size_t)i * UFS_BLOCK_SIZE) != 0)
+                             block_bitmap + (size_t)i * UFS_BLOCK_SIZE) != 0)
         {
             return -1;
         }
@@ -200,7 +192,6 @@ static int flush_block_bitmap(void)
 
     return 0;
 }
-
 
 /* =========================================================
  * Inode Helpers
@@ -229,7 +220,6 @@ static int read_inode(uint32_t inum, struct ufs_inode *out)
     return 0;
 }
 
-
 static int write_inode(uint32_t inum, const struct ufs_inode *in)
 {
     if (inum >= sb.total_inodes)
@@ -251,7 +241,6 @@ static int write_inode(uint32_t inum, const struct ufs_inode *in)
 
     return disk_write_block(block, buf);
 }
-
 
 /*
  * Allocate a free inode number. Marks it used in the bitmap
@@ -277,13 +266,11 @@ static int64_t alloc_inode(void)
     return idx;
 }
 
-
 static void free_inode(uint32_t inum)
 {
     bitmap_clear(inode_bitmap, inum);
     flush_inode_bitmap();
 }
-
 
 /*
  * Allocate a free data block. Returns the ABSOLUTE block
@@ -313,7 +300,6 @@ static int64_t alloc_block(void)
     return (int64_t)(sb.data_start + (uint64_t)idx);
 }
 
-
 static void free_block(uint64_t abs_block_num)
 {
     if (abs_block_num < sb.data_start)
@@ -331,7 +317,6 @@ static void free_block(uint64_t abs_block_num)
     flush_block_bitmap();
 }
 
-
 /* =========================================================
  * Directory Helpers
  *
@@ -342,8 +327,8 @@ static void free_block(uint64_t abs_block_num)
  * ========================================================= */
 
 static int dir_find_entry(const struct ufs_inode *dir,
-                           const char *name,
-                           uint32_t *out_inode)
+                          const char *name,
+                          uint32_t *out_inode)
 {
     for (uint32_t b = 0; b < dir->block_count && b < 10; b++)
     {
@@ -375,14 +360,13 @@ static int dir_find_entry(const struct ufs_inode *dir,
     return 0; /* not found */
 }
 
-
 /*
  * Add (name -> child_inum) to a directory. Updates and
  * persists `dir` (the parent inode) if a new block had to be
  * allocated.
  */
 static int dir_add_entry(uint32_t dir_inum, struct ufs_inode *dir,
-                          const char *name, uint32_t child_inum)
+                         const char *name, uint32_t child_inum)
 {
     /* Try to find a free slot in an already-allocated block. */
     for (uint32_t b = 0; b < dir->block_count && b < 10; b++)
@@ -442,7 +426,6 @@ static int dir_add_entry(uint32_t dir_inum, struct ufs_inode *dir,
     return write_inode(dir_inum, dir);
 }
 
-
 static int dir_remove_entry(struct ufs_inode *dir, const char *name)
 {
     for (uint32_t b = 0; b < dir->block_count && b < 10; b++)
@@ -473,7 +456,6 @@ static int dir_remove_entry(struct ufs_inode *dir, const char *name)
     return -1;
 }
 
-
 static int dir_is_empty(const struct ufs_inode *dir)
 {
     for (uint32_t b = 0; b < dir->block_count && b < 10; b++)
@@ -502,7 +484,6 @@ static int dir_is_empty(const struct ufs_inode *dir)
 
     return 1;
 }
-
 
 /* =========================================================
  * Path Resolution
@@ -575,7 +556,6 @@ static int resolve_path(const char *path, uint32_t *out_inode)
     return 0;
 }
 
-
 /*
  * Split `path` into its parent directory (resolved to an
  * inode number) and the final path component (copied into
@@ -583,7 +563,7 @@ static int resolve_path(const char *path, uint32_t *out_inode)
  * bytes).
  */
 static int resolve_parent(const char *path, uint32_t *parent_inode,
-                           char *name_out)
+                          char *name_out)
 {
     if (path == NULL || path[0] != '/')
     {
@@ -642,7 +622,6 @@ static int resolve_parent(const char *path, uint32_t *parent_inode,
     *slash = '\0';
     return resolve_path(copy, parent_inode);
 }
-
 
 /* =========================================================
  * Filesystem API
@@ -704,9 +683,7 @@ int ufs_format(const char *image_path, size_t image_size)
 
     new_sb.inode_table_start =
         new_sb.block_bitmap_start + new_sb.block_bitmap_blocks;
-    new_sb.inode_table_blocks = (uint32_t)
-        (((uint64_t)total_inodes * sizeof(struct ufs_inode)
-          + UFS_BLOCK_SIZE - 1) / UFS_BLOCK_SIZE);
+    new_sb.inode_table_blocks = (uint32_t)(((uint64_t)total_inodes * sizeof(struct ufs_inode) + UFS_BLOCK_SIZE - 1) / UFS_BLOCK_SIZE);
 
     new_sb.data_start =
         new_sb.inode_table_start + new_sb.inode_table_blocks;
@@ -778,95 +755,44 @@ int ufs_format(const char *image_path, size_t image_size)
 
 int ufs_mount(const char *image_path)
 {
-    if (image_path == NULL)
-    {
-        errno = EINVAL;
-        return -1;
-    }
-
     if (disk != NULL)
     {
         errno = EBUSY;
         return -1;
     }
 
-    FILE *f = fopen(image_path, "r+b");
-    if (f == NULL)
+    disk = fopen(image_path, "rb+");
+    if (disk == NULL)
     {
         return -1;
     }
 
-    uint8_t sb_block[UFS_BLOCK_SIZE];
-    if (fread(sb_block, 1, UFS_BLOCK_SIZE, f) != UFS_BLOCK_SIZE)
+    if (fseeko(disk, 0, SEEK_SET) != 0 ||
+        fread(&sb, 1, sizeof(sb), disk) != sizeof(sb))
     {
-        fclose(f);
-        errno = EIO;
-        return -1;
-    }
-
-    struct ufs_superblock loaded;
-    memcpy(&loaded, sb_block, sizeof(loaded));
-
-    if (loaded.magic != UFS_MAGIC || loaded.version != UFS_VERSION
-        || loaded.block_size != UFS_BLOCK_SIZE)
-    {
-        fclose(f);
+        fclose(disk);
+        disk = NULL;
         errno = EINVAL;
         return -1;
     }
 
-    sb = loaded;
-    disk = f;
-
-    size_t ibmp_bytes = (size_t)sb.inode_bitmap_blocks * UFS_BLOCK_SIZE;
-    size_t bbmp_bytes = (size_t)sb.block_bitmap_blocks * UFS_BLOCK_SIZE;
-
-    inode_bitmap = malloc(ibmp_bytes);
-    block_bitmap = malloc(bbmp_bytes);
-
-    if (inode_bitmap == NULL || block_bitmap == NULL)
+    if (sb.magic != UFS_MAGIC)
     {
-        free(inode_bitmap);
-        free(block_bitmap);
-        inode_bitmap = NULL;
-        block_bitmap = NULL;
-        fclose(f);
+        fclose(disk);
         disk = NULL;
-        errno = ENOMEM;
+        errno = EINVAL;
         return -1;
     }
 
-    for (uint32_t i = 0; i < sb.inode_bitmap_blocks; i++)
-    {
-        if (disk_read_block(sb.inode_bitmap_start + i,
-                             inode_bitmap + (size_t)i * UFS_BLOCK_SIZE) != 0)
-        {
-            free(inode_bitmap);
-            free(block_bitmap);
-            inode_bitmap = NULL;
-            block_bitmap = NULL;
-            fclose(f);
-            disk = NULL;
-            return -1;
-        }
-    }
+    size_t ibmp_bytes = (size_t)sb.inode_bitmap_blocks * UFS_BLOCK_SIZE;
+    inode_bitmap = malloc(ibmp_bytes);
+    fseeko(disk, (off_t)sb.inode_bitmap_start * UFS_BLOCK_SIZE, SEEK_SET);
+    fread(inode_bitmap, 1, ibmp_bytes, disk);
 
-    for (uint32_t i = 0; i < sb.block_bitmap_blocks; i++)
-    {
-        if (disk_read_block(sb.block_bitmap_start + i,
-                             block_bitmap + (size_t)i * UFS_BLOCK_SIZE) != 0)
-        {
-            free(inode_bitmap);
-            free(block_bitmap);
-            inode_bitmap = NULL;
-            block_bitmap = NULL;
-            fclose(f);
-            disk = NULL;
-            return -1;
-        }
-    }
-
-    memset(open_files, 0, sizeof(open_files));
+    size_t bbmp_bytes = (size_t)sb.block_bitmap_blocks * UFS_BLOCK_SIZE;
+    block_bitmap = malloc(bbmp_bytes);
+    fseeko(disk, (off_t)sb.block_bitmap_start * UFS_BLOCK_SIZE, SEEK_SET);
+    fread(block_bitmap, 1, bbmp_bytes, disk);
 
     return 0;
 }
@@ -879,18 +805,24 @@ int ufs_unmount(void)
         return -1;
     }
 
-    flush_inode_bitmap();
-    flush_block_bitmap();
+    if (fclose(disk) != 0)
+    {
+        return -1;
+    }
 
-    fclose(disk);
     disk = NULL;
+    memset(&sb, 0, sizeof(sb));
 
-    free(inode_bitmap);
-    free(block_bitmap);
-    inode_bitmap = NULL;
-    block_bitmap = NULL;
-
-    memset(open_files, 0, sizeof(open_files));
+    if (inode_bitmap)
+    {
+        free(inode_bitmap);
+        inode_bitmap = NULL;
+    }
+    if (block_bitmap)
+    {
+        free(block_bitmap);
+        block_bitmap = NULL;
+    }
 
     return 0;
 }
