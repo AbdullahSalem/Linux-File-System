@@ -138,7 +138,7 @@ struct ufs_open_file
 
     int flags;
 
-    off_t offset;
+    off_t position;
 };
 
 
