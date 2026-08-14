@@ -57,8 +57,8 @@ struct ufs_superblock
     /* Filesystem version */
     uint32_t version;
 
-    /* Reserved */
-    uint8_t reserved[448];
+    /* Reserved (pads the struct out to exactly 512 bytes) */
+    uint8_t reserved[440];
 };
 
 
@@ -98,6 +98,9 @@ struct ufs_inode
     uint32_t indirect_block;
     uint32_t double_indirect_block;
     uint32_t triple_indirect_block;
+
+    /* Reserved (pads the struct out to exactly 256 bytes) */
+    uint8_t reserved[128];
 };
 
 /*
@@ -110,6 +113,24 @@ _Static_assert(sizeof(struct ufs_inode) == 256,
 
 _Static_assert(sizeof(struct ufs_superblock) == 512,
                "ufs_superblock must be exactly 512 bytes");
+
+
+/*
+ * On-disk directory entry.
+ *
+ * A directory's data blocks (direct_blocks[]) are simply
+ * arrays of these structures. Unused slots have `used == 0`
+ * and can be recycled by later ufs_mkdir()/ufs_create() calls.
+ */
+struct ufs_disk_dirent
+{
+    uint32_t used;
+    uint32_t inode;
+    char name[UFS_MAX_NAME + 1];
+};
+
+#define UFS_DIRENTS_PER_BLOCK \
+    (UFS_BLOCK_SIZE / sizeof(struct ufs_disk_dirent))
 
 
 /* =========================================================
