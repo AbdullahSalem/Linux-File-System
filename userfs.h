@@ -26,10 +26,10 @@ struct ufs_stat {
     size_t size;
 };
 
-struct ufs_dirent {
+struct ufs_dirent
+{
+    uint32_t inode_number;
     char name[UFS_MAX_NAME + 1];
-    int type;
-    size_t size;
 };
 
 int ufs_format(const char *image_path, size_t image_size);
