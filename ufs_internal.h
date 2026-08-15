@@ -87,6 +87,8 @@ struct ufs_inode
     uint8_t reserved[44];
 };
 
+#define UFS_INLINE_DATA_MAX_SIZE (sizeof(((struct ufs_inode *)0)->direct_blocks))
+
 
 _Static_assert(sizeof(struct ufs_inode) == 256,
                "ufs_inode must be exactly 256 bytes");

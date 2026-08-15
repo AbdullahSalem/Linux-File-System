@@ -1311,6 +1311,7 @@ int ufs_create(const char *path)
     inode.created_at = (int64_t)time(NULL);
     inode.modified_at = inode.created_at;
     inode.block_count = 0;
+    inode.flags = UFS_INODE_FLAG_INLINE_DATA;
 
     result = write_inode(
         target_inum,
@@ -1637,6 +1638,13 @@ ssize_t ufs_read(int fd, void *buf, size_t count)
     uint64_t available = inode.size - (uint64_t)offset;
     size_t to_read = (count < available) ? count : (size_t)available;
 
+    if (inode.flags & UFS_INODE_FLAG_INLINE_DATA)
+    {
+        memcpy(buf, (const uint8_t *)inode.direct_blocks + offset, to_read);
+        open_files[fd].position += (off_t)to_read;
+        return (ssize_t)to_read;
+    }
+
     size_t bytes_done = 0;
     uint8_t block_buf[UFS_BLOCK_SIZE];
     const uint32_t ptrs_per_block = UFS_BLOCK_SIZE / sizeof(uint32_t);
@@ -1745,6 +1753,51 @@ ssize_t ufs_write(int fd, const void *buf, size_t count)
     {
 
         start_offset = (off_t)inode.size;
+    }
+
+    if (inode.flags & UFS_INODE_FLAG_INLINE_DATA)
+    {
+        uint64_t new_end = (uint64_t)start_offset + count;
+
+        if (new_end <= UFS_INLINE_DATA_MAX_SIZE)
+        {
+            memcpy((uint8_t *)inode.direct_blocks + start_offset, buf, count);
+
+            if (new_end > inode.size)
+            {
+                inode.size = new_end;
+            }
+
+            inode.modified_at = (int64_t)time(NULL);
+
+            if (write_inode(inum, &inode) != 0)
+            {
+                return -1;
+            }
+
+            open_files[fd].position = start_offset + (off_t)count;
+            return (ssize_t)count;
+        }
+
+        int64_t nb = alloc_block();
+        if (nb < 0)
+        {
+            return -1;
+        }
+
+        uint8_t evict_block[UFS_BLOCK_SIZE];
+        memset(evict_block, 0, sizeof(evict_block));
+        memcpy(evict_block, inode.direct_blocks, UFS_INLINE_DATA_MAX_SIZE);
+
+        if (disk_write_block((uint64_t)nb, evict_block) != 0)
+        {
+            free_block((uint64_t)nb);
+            return -1;
+        }
+
+        memset(inode.direct_blocks, 0, sizeof(inode.direct_blocks));
+        inode.direct_blocks[0] = (uint32_t)nb;
+        inode.flags &= ~UFS_INODE_FLAG_INLINE_DATA;
     }
 
     size_t bytes_done = 0;
@@ -2104,6 +2157,18 @@ int ufs_stat(const char *path, struct ufs_stat *st)
 
 static int purge_trashed_inode(uint32_t inum, struct ufs_inode *ino)
 {
+    if (ino->flags & UFS_INODE_FLAG_INLINE_DATA)
+    {
+        memset(ino, 0, sizeof(*ino));
+
+        if (write_inode(inum, ino) != 0)
+        {
+            return -1;
+        }
+
+        return free_inode(inum);
+    }
+
     uint8_t zeros[UFS_BLOCK_SIZE];
     memset(zeros, 0, sizeof(zeros));
 
@@ -2208,7 +2273,7 @@ int ufs_fsck(void)
         if (read_inode(i, &ino) != 0)
             continue;
 
-        if (ino.used == 1)
+        if (ino.used == 1 && !(ino.flags & UFS_INODE_FLAG_INLINE_DATA))
         {
             /* Check direct blocks */
             for (int b = 0; b < 10; b++)
