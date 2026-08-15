@@ -291,21 +291,9 @@ static int free_inode(uint32_t inum)
     return 0;
 }
 
-int64_t alloc_block(void)
+static int64_t alloc_block(void)
 {
-    uint8_t zero[UFS_BLOCK_SIZE];
-
-    int64_t idx;
-
-    int result;
-
-    memset(zero, 0, sizeof(zero));
-
-    idx = bitmap_find_free(
-        block_bitmap,
-        sb.total_blocks
-    );
-
+    int64_t idx = bitmap_find_free(block_bitmap, sb.total_blocks);
     if (idx < 0)
     {
         errno = ENOSPC;
@@ -314,30 +302,18 @@ int64_t alloc_block(void)
 
     bitmap_set(block_bitmap, (uint64_t)idx);
 
-    result = flush_block_bitmap();
-
-    if (result != 0)
+    if (flush_block_bitmap() != 0)
     {
         bitmap_clear(block_bitmap, (uint64_t)idx);
         return -1;
     }
 
-    result = disk_write_block(
-        (uint64_t)idx,
-        zero
-    );
+    uint8_t zero[UFS_BLOCK_SIZE];
+    memset(zero, 0, sizeof(zero));
+    disk_write_block((uint64_t)idx, zero);
 
-    if (result != 0)
-    {
-        bitmap_clear(block_bitmap, (uint64_t)idx);
-        flush_block_bitmap();
-
-        return -1;
-    }
-
-    return idx;
+    return (int64_t)idx;
 }
-
 
 static void free_block(uint64_t abs_block_num)
 {
@@ -803,8 +779,7 @@ int64_t ufs_get_file_size(int fd)
 
     result = read_inode(
         inode_number,
-        &inode
-    );
+        &inode);
 
     if (result != 0)
     {
@@ -1271,8 +1246,7 @@ int ufs_create(const char *path)
     result = resolve_parent(
         path,
         &parent_inum,
-        name
-    );
+        name);
 
     if (result != 0)
     {
@@ -1281,8 +1255,7 @@ int ufs_create(const char *path)
 
     result = read_inode(
         parent_inum,
-        &parent
-    );
+        &parent);
 
     if (result != 0)
     {
@@ -1298,8 +1271,7 @@ int ufs_create(const char *path)
     found = dir_find_entry(
         &parent,
         name,
-        &target_inum
-    );
+        &target_inum);
 
     if (found < 0)
     {
@@ -1329,8 +1301,7 @@ int ufs_create(const char *path)
     strncpy(
         inode.name,
         name,
-        UFS_MAX_NAME
-    );
+        UFS_MAX_NAME);
 
     inode.name[UFS_MAX_NAME] = '\0';
 
@@ -1343,8 +1314,7 @@ int ufs_create(const char *path)
 
     result = write_inode(
         target_inum,
-        &inode
-    );
+        &inode);
 
     if (result != 0)
     {
@@ -1356,8 +1326,7 @@ int ufs_create(const char *path)
         parent_inum,
         &parent,
         name,
-        target_inum
-    );
+        target_inum);
 
     if (result != 0)
     {
@@ -1369,8 +1338,7 @@ int ufs_create(const char *path)
 
     result = write_inode(
         parent_inum,
-        &parent
-    );
+        &parent);
 
     if (result != 0)
     {
@@ -1403,8 +1371,7 @@ int ufs_unlink(const char *path)
     result = resolve_parent(
         path,
         &parent_inum,
-        name
-    );
+        name);
 
     if (result != 0)
     {
@@ -1413,8 +1380,7 @@ int ufs_unlink(const char *path)
 
     result = read_inode(
         parent_inum,
-        &parent
-    );
+        &parent);
 
     if (result != 0)
     {
@@ -1430,8 +1396,7 @@ int ufs_unlink(const char *path)
     found = dir_find_entry(
         &parent,
         name,
-        &target_inum
-    );
+        &target_inum);
 
     if (found < 0)
     {
@@ -1446,8 +1411,7 @@ int ufs_unlink(const char *path)
 
     result = read_inode(
         target_inum,
-        &target
-    );
+        &target);
 
     if (result != 0)
     {
@@ -1472,27 +1436,22 @@ int ufs_unlink(const char *path)
         if (target.direct_blocks[i] != 0)
         {
             free_block(
-                target.direct_blocks[i]
-            );
+                target.direct_blocks[i]);
 
             target.direct_blocks[i] = 0;
         }
     }
 
-   
     if (target.indirect_block != 0)
     {
-        uint32_t block_numbers[
-            UFS_BLOCK_SIZE / sizeof(uint32_t)
-        ];
+        uint32_t block_numbers[UFS_BLOCK_SIZE / sizeof(uint32_t)];
 
         size_t count;
         size_t j;
 
         result = disk_read_block(
             target.indirect_block,
-            block_numbers
-        );
+            block_numbers);
 
         if (result != 0)
         {
@@ -1507,23 +1466,19 @@ int ufs_unlink(const char *path)
             if (block_numbers[j] != 0)
             {
                 free_block(
-                    block_numbers[j]
-                );
+                    block_numbers[j]);
             }
         }
 
-        
         free_block(
-            target.indirect_block
-        );
+            target.indirect_block);
 
         target.indirect_block = 0;
     }
 
     result = dir_remove_entry(
         &parent,
-        name
-    );
+        name);
 
     if (result != 0)
     {
@@ -1534,35 +1489,29 @@ int ufs_unlink(const char *path)
 
     result = write_inode(
         parent_inum,
-        &parent
-    );
+        &parent);
 
     if (result != 0)
     {
         return -1;
     }
 
-    
     memset(
         &target,
         0,
-        sizeof(target)
-    );
+        sizeof(target));
 
     result = write_inode(
         target_inum,
-        &target
-    );
+        &target);
 
     if (result != 0)
     {
         return -1;
     }
 
-  
     result = free_inode(
-        target_inum
-    );
+        target_inum);
 
     if (result != 0)
     {
@@ -1571,7 +1520,6 @@ int ufs_unlink(const char *path)
 
     return 0;
 }
-
 
 // 4
 int ufs_open(const char *path, int flags)
@@ -2196,190 +2144,95 @@ int ufs_stat(const char *path, struct ufs_stat *st)
 
 int ufs_fsck(void)
 {
-    size_t bitmap_size;
-    uint8_t *shadow_bitmap;
-
-    int is_corrupted;
-
     if (disk == NULL)
     {
         errno = EINVAL;
         return -1;
     }
 
-    if (sb.magic != UFS_MAGIC ||
-        sb.total_inodes == 0 ||
-        sb.total_blocks == 0)
+    if (sb.magic != UFS_MAGIC || sb.total_inodes == 0 || sb.total_blocks == 0)
     {
-        fprintf(
-            stderr,
-            "fsck: Fatal error - Superblock is corrupted.\n"
-        );
-
+        fprintf(stderr, "fsck: Fatal error - Superblock is corrupted.\n");
         return -1;
     }
 
-    bitmap_size =
-        (size_t)sb.block_bitmap_blocks * UFS_BLOCK_SIZE;
-
-    shadow_bitmap = calloc(
-        1,
-        bitmap_size
-    );
-
-    if (shadow_bitmap == NULL)
+    size_t bbmp_bytes = (size_t)sb.block_bitmap_blocks * UFS_BLOCK_SIZE;
+    uint8_t *shadow_bbmp = calloc(1, bbmp_bytes);
+    if (shadow_bbmp == NULL)
     {
         errno = ENOMEM;
         return -1;
     }
 
-    
-    for (uint64_t block = 0;
-         block < sb.data_start;
-         block++)
+    for (uint64_t i = 0; i < sb.data_start; i++)
     {
-        shadow_bitmap[block / 8] |=
-            (uint8_t)(1u << (block % 8));
+        shadow_bbmp[i / 8] |= (uint8_t)(1u << (i % 8));
     }
 
- 
-    for (uint32_t inode_number = 0;
-         inode_number < sb.total_inodes;
-         inode_number++)
+    for (uint32_t i = 0; i < sb.total_inodes; i++)
     {
-        struct ufs_inode inode;
-        int result;
-
-        result = read_inode(
-            inode_number,
-            &inode
-        );
-
-        if (result != 0)
-        {
+        struct ufs_inode ino;
+        if (read_inode(i, &ino) != 0)
             continue;
-        }
 
-        if (inode.used != 1)
+        if (ino.used == 1)
         {
-            continue;
-        }
-
-      
-        for (int i = 0; i < 10; i++)
-        {
-            uint32_t block;
-
-            block = inode.direct_blocks[i];
-
-            if (block >= sb.data_start &&
-                block < sb.total_blocks)
+            /* Check direct blocks */
+            for (int b = 0; b < 10; b++)
             {
-                shadow_bitmap[block / 8] |=
-                    (uint8_t)(
-                        1u << (block % 8)
-                    );
-            }
-        }
-
-       
-        if (inode.indirect_block >= sb.data_start &&
-            inode.indirect_block < sb.total_blocks)
-        {
-            uint32_t block_numbers[
-                UFS_BLOCK_SIZE / sizeof(uint32_t)
-            ];
-
-            size_t block_count;
-            size_t i;
-
-          
-            shadow_bitmap[
-                inode.indirect_block / 8
-            ] |=
-                (uint8_t)(
-                    1u <<
-                    (inode.indirect_block % 8)
-                );
-
-         
-            result = disk_read_block(
-                inode.indirect_block,
-                block_numbers
-            );
-
-            if (result != 0)
-            {
-                continue;
-            }
-
-            block_count =
-                UFS_BLOCK_SIZE / sizeof(uint32_t);
-
-            for (i = 0;
-                 i < block_count;
-                 i++)
-            {
-                uint32_t block;
-
-                block = block_numbers[i];
-
-                if (block >= sb.data_start &&
-                    block < sb.total_blocks)
+                uint32_t blk = ino.direct_blocks[b];
+                if (blk >= sb.data_start && blk < sb.total_blocks)
                 {
-                    shadow_bitmap[
-                        block / 8
-                    ] |=
-                        (uint8_t)(
-                            1u <<
-                            (block % 8)
-                        );
+                    shadow_bbmp[blk / 8] |= (uint8_t)(1u << (blk % 8));
+                }
+            }
+
+            /* Check indirect block (merged from team's work) */
+            if (ino.indirect_block >= sb.data_start && ino.indirect_block < sb.total_blocks)
+            {
+                shadow_bbmp[ino.indirect_block / 8] |= (uint8_t)(1u << (ino.indirect_block % 8));
+
+                uint32_t block_numbers[UFS_BLOCK_SIZE / sizeof(uint32_t)];
+                if (disk_read_block(ino.indirect_block, block_numbers) == 0)
+                {
+                    size_t block_count = UFS_BLOCK_SIZE / sizeof(uint32_t);
+                    for (size_t j = 0; j < block_count; j++)
+                    {
+                        uint32_t blk = block_numbers[j];
+                        if (blk >= sb.data_start && blk < sb.total_blocks)
+                        {
+                            shadow_bbmp[blk / 8] |= (uint8_t)(1u << (blk % 8));
+                        }
+                    }
                 }
             }
         }
     }
 
-    
-    is_corrupted = 0;
-
-    for (size_t i = 0;
-         i < bitmap_size;
-         i++)
+    int is_corrupted = 0;
+    for (size_t i = 0; i < bbmp_bytes; i++)
     {
-        if (block_bitmap[i] != shadow_bitmap[i])
+        if (block_bitmap[i] != shadow_bbmp[i])
         {
-            block_bitmap[i] = shadow_bitmap[i];
+            block_bitmap[i] = shadow_bbmp[i];
             is_corrupted = 1;
         }
     }
 
-    
     if (is_corrupted)
     {
-        int result;
-
-        result = flush_block_bitmap();
-
-        if (result != 0)
+        if (flush_block_bitmap() != 0)
         {
-            free(shadow_bitmap);
+            free(shadow_bbmp);
             return -1;
         }
-
-        printf(
-            "fsck: File system repaired successfully "
-            "(Orphaned blocks recovered).\n"
-        );
+        printf("fsck: File system repaired successfully (Orphaned blocks recovered).\n");
     }
     else
     {
-        printf(
-            "fsck: File system is clean. "
-            "No errors found.\n"
-        );
+        printf("fsck: File system is clean. No errors found.\n");
     }
 
-    free(shadow_bitmap);
-
+    free(shadow_bbmp);
     return 0;
 }
