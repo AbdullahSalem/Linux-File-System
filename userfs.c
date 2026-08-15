@@ -291,9 +291,21 @@ static int free_inode(uint32_t inum)
     return 0;
 }
 
-static int64_t alloc_block(void)
+int64_t alloc_block(void)
 {
-    int64_t idx = bitmap_find_free(block_bitmap, sb.total_blocks);
+    uint8_t zero[UFS_BLOCK_SIZE];
+
+    int64_t idx;
+
+    int result;
+
+    memset(zero, 0, sizeof(zero));
+
+    idx = bitmap_find_free(
+        block_bitmap,
+        sb.total_blocks
+    );
+
     if (idx < 0)
     {
         errno = ENOSPC;
@@ -302,18 +314,30 @@ static int64_t alloc_block(void)
 
     bitmap_set(block_bitmap, (uint64_t)idx);
 
-    if (flush_block_bitmap() != 0)
+    result = flush_block_bitmap();
+
+    if (result != 0)
     {
         bitmap_clear(block_bitmap, (uint64_t)idx);
         return -1;
     }
 
-    uint8_t zero[UFS_BLOCK_SIZE];
-    memset(zero, 0, sizeof(zero));
-    disk_write_block((uint64_t)idx, zero);
+    result = disk_write_block(
+        (uint64_t)idx,
+        zero
+    );
 
-    return (int64_t)idx;
+    if (result != 0)
+    {
+        bitmap_clear(block_bitmap, (uint64_t)idx);
+        flush_block_bitmap();
+
+        return -1;
+    }
+
+    return idx;
 }
+
 
 static void free_block(uint64_t abs_block_num)
 {
@@ -756,11 +780,11 @@ static int resolve_parent(const char *path,
 
     return resolve_path(copy, parent_inode);
 }
-
-int32_t ufs_get_file_size(int fd)
+int64_t ufs_get_file_size(int fd)
 {
     uint32_t inode_number;
     struct ufs_inode inode;
+
     int result;
 
     if (fd < 0 || fd >= UFS_MAX_OPEN_FILES)
@@ -777,14 +801,17 @@ int32_t ufs_get_file_size(int fd)
 
     inode_number = open_files[fd].inode_number;
 
-    result = read_inode(inode_number, &inode);
+    result = read_inode(
+        inode_number,
+        &inode
+    );
 
     if (result != 0)
     {
         return -1;
     }
 
-    return (int32_t)inode.size;
+    return (int64_t)inode.size;
 }
 
 // Filesystem API
@@ -1221,190 +1248,326 @@ int ufs_listdir(const char *path, struct ufs_dirent *entries, size_t max_entries
     return (int)count;
 }
 
-
 int ufs_create(const char *path)
 {
-    if (require_mounted() != 0)
-    {
-        return -1;
-    }
-    if (validate_path(path) != 0)
-    {
-        return -1;
-    }
-    if (strcmp(path, "/") == 0)
-    {
-        /* The root directory always exists. */
-        errno = EEXIST;
-        return -1;
-    }
-
-
-    int parent_inum, target_inum;
-    char name[UFS_MAX_NAME + 1];
-
-
-    if (resolve_parent(path, &parent_inum, &target_inum, name) != 0)
-    {
-        return -1;
-    }
-    if (target_inum >= 0)
-    {
-        errno = EEXIST;
-        return -1;
-    }
-
+    uint32_t parent_inum;
+    uint32_t target_inum;
 
     struct ufs_inode parent;
-    if (read_inode((uint32_t)parent_inum, &parent) != 0)
+    struct ufs_inode inode;
+
+    char name[UFS_MAX_NAME + 1];
+
+    int found;
+    int64_t new_inum;
+    int result;
+
+    if (disk == NULL)
     {
-        return -1;
-    }
-    if (parent.data.directory.child_count >= 44)
-    {
-        errno = ENOSPC;
+        errno = EINVAL;
         return -1;
     }
 
+    result = resolve_parent(
+        path,
+        &parent_inum,
+        name
+    );
 
-    int new_inum = alloc_inode();
+    if (result != 0)
+    {
+        return -1;
+    }
+
+    result = read_inode(
+        parent_inum,
+        &parent
+    );
+
+    if (result != 0)
+    {
+        return -1;
+    }
+
+    if (parent.type != UFS_TYPE_DIR)
+    {
+        errno = ENOTDIR;
+        return -1;
+    }
+
+    found = dir_find_entry(
+        &parent,
+        name,
+        &target_inum
+    );
+
+    if (found < 0)
+    {
+        return -1;
+    }
+
+    if (found == 1)
+    {
+        errno = EEXIST;
+        return -1;
+    }
+
+    new_inum = alloc_inode();
+
     if (new_inum < 0)
     {
-        return -1; /* errno set by alloc_inode (ENOSPC) */
-    }
-
-
-    struct ufs_inode child;
-    memset(&child, 0, sizeof(child));
-    child.used = 1;
-    child.type = UFS_TYPE_FILE;
-    strncpy(child.name, name, UFS_MAX_NAME);
-    child.name[UFS_MAX_NAME] = '\0';
-    child.size = 0;
-    child.parent_inode = parent_inum;
-    child.permissions = 0;
-
-
-    time_t now = time(NULL);
-    child.created_at = (int64_t)now;
-    child.modified_at = (int64_t)now;
-    child.data_blocks = 0;
-    /* child.data.file.* already zeroed by memset above. */
-
-
-    if (write_inode((uint32_t)new_inum, &child) != 0)
-    {
-        free_inode_num((uint32_t)new_inum);
         return -1;
     }
 
+    target_inum = (uint32_t)new_inum;
 
-    if (dir_add_child(&parent, (uint32_t)new_inum) != 0)
+    memset(&inode, 0, sizeof(inode));
+
+    inode.used = 1;
+    inode.type = UFS_TYPE_FILE;
+
+    strncpy(
+        inode.name,
+        name,
+        UFS_MAX_NAME
+    );
+
+    inode.name[UFS_MAX_NAME] = '\0';
+
+    inode.size = 0;
+    inode.parent_inode = (int32_t)parent_inum;
+    inode.permissions = 0644;
+    inode.created_at = (int64_t)time(NULL);
+    inode.modified_at = inode.created_at;
+    inode.block_count = 0;
+
+    result = write_inode(
+        target_inum,
+        &inode
+    );
+
+    if (result != 0)
     {
-        free_inode_num((uint32_t)new_inum);
-        return -1; /* errno set by dir_add_child (ENOSPC) */
-    }
-
-
-    if (write_inode((uint32_t)parent_inum, &parent) != 0)
-    {
-        free_inode_num((uint32_t)new_inum);
+        free_inode(target_inum);
         return -1;
     }
 
+    result = dir_add_entry(
+        parent_inum,
+        &parent,
+        name,
+        target_inum
+    );
+
+    if (result != 0)
+    {
+        free_inode(target_inum);
+        return -1;
+    }
+
+    parent.modified_at = (int64_t)time(NULL);
+
+    result = write_inode(
+        parent_inum,
+        &parent
+    );
+
+    if (result != 0)
+    {
+        return -1;
+    }
 
     return 0;
 }
 
-
 int ufs_unlink(const char *path)
 {
-    if (require_mounted() != 0)
-    {
-        return -1;
-    }
-    if (validate_path(path) != 0)
-    {
-        return -1;
-    }
-    if (strcmp(path, "/") == 0)
-    {
-        errno = EISDIR;
-        return -1;
-    }
+    uint32_t parent_inum;
+    uint32_t target_inum;
 
+    struct ufs_inode parent;
+    struct ufs_inode target;
 
-    int parent_inum, target_inum;
     char name[UFS_MAX_NAME + 1];
 
+    int found;
+    int result;
+    int i;
 
-    if (resolve_parent(path, &parent_inum, &target_inum, name) != 0)
+    if (disk == NULL)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    result = resolve_parent(
+        path,
+        &parent_inum,
+        name
+    );
+
+    if (result != 0)
     {
         return -1;
     }
-    if (target_inum < 0)
+
+    result = read_inode(
+        parent_inum,
+        &parent
+    );
+
+    if (result != 0)
+    {
+        return -1;
+    }
+
+    if (parent.type != UFS_TYPE_DIR)
+    {
+        errno = ENOTDIR;
+        return -1;
+    }
+
+    found = dir_find_entry(
+        &parent,
+        name,
+        &target_inum
+    );
+
+    if (found < 0)
+    {
+        return -1;
+    }
+
+    if (found == 0)
     {
         errno = ENOENT;
         return -1;
     }
 
+    result = read_inode(
+        target_inum,
+        &target
+    );
 
-    struct ufs_inode target;
-    if (read_inode((uint32_t)target_inum, &target) != 0)
+    if (result != 0)
     {
         return -1;
     }
+
     if (target.type == UFS_TYPE_DIR)
     {
         errno = EISDIR;
         return -1;
     }
 
-
-    /* Release every data block owned by the file. */
-    for (int i = 0; i < 10; i++)
+    if (target.double_indirect_block != 0 ||
+        target.triple_indirect_block != 0)
     {
-        if (target.data.file.direct_blocks[i] != 0)
+        errno = EFBIG;
+        return -1;
+    }
+
+    for (i = 0; i < 10; i++)
+    {
+        if (target.direct_blocks[i] != 0)
         {
-            free_data_block(target.data.file.direct_blocks[i]);
+            free_block(
+                target.direct_blocks[i]
+            );
+
+            target.direct_blocks[i] = 0;
         }
     }
-    if (target.data.file.indirect_block != 0)
+
+   
+    if (target.indirect_block != 0)
     {
-        free_indirect_chain(target.data.file.indirect_block, 1);
-    }
-    if (target.data.file.double_indirect_block != 0)
-    {
-        free_indirect_chain(target.data.file.double_indirect_block, 2);
-    }
-    if (target.data.file.triple_indirect_block != 0)
-    {
-        free_indirect_chain(target.data.file.triple_indirect_block, 3);
+        uint32_t block_numbers[
+            UFS_BLOCK_SIZE / sizeof(uint32_t)
+        ];
+
+        size_t count;
+        size_t j;
+
+        result = disk_read_block(
+            target.indirect_block,
+            block_numbers
+        );
+
+        if (result != 0)
+        {
+            return -1;
+        }
+
+        count =
+            UFS_BLOCK_SIZE / sizeof(uint32_t);
+
+        for (j = 0; j < count; j++)
+        {
+            if (block_numbers[j] != 0)
+            {
+                free_block(
+                    block_numbers[j]
+                );
+            }
+        }
+
+        
+        free_block(
+            target.indirect_block
+        );
+
+        target.indirect_block = 0;
     }
 
+    result = dir_remove_entry(
+        &parent,
+        name
+    );
 
-    /* Wipe and free the inode itself. */
-    memset(&target, 0, sizeof(target));
-    target.used = 0;
-    if (write_inode((uint32_t)target_inum, &target) != 0)
+    if (result != 0)
     {
         return -1;
     }
-    free_inode_num((uint32_t)target_inum);
 
+    parent.modified_at = (int64_t)time(NULL);
 
-    /* Remove the directory entry from the parent. */
-    struct ufs_inode parent;
-    if (read_inode((uint32_t)parent_inum, &parent) != 0)
+    result = write_inode(
+        parent_inum,
+        &parent
+    );
+
+    if (result != 0)
     {
         return -1;
     }
-    dir_remove_child(&parent, (uint32_t)target_inum);
-    if (write_inode((uint32_t)parent_inum, &parent) != 0)
+
+    
+    memset(
+        &target,
+        0,
+        sizeof(target)
+    );
+
+    result = write_inode(
+        target_inum,
+        &target
+    );
+
+    if (result != 0)
     {
         return -1;
     }
 
+  
+    result = free_inode(
+        target_inum
+    );
+
+    if (result != 0)
+    {
+        return -1;
+    }
 
     return 0;
 }
@@ -1472,7 +1635,7 @@ int ufs_close(int fd)
 off_t ufs_seek(int fd, off_t offset, int whence)
 {
     off_t new_position;
-    int32_t file_size;
+    int64_t file_size;
 
     if (fd < 0 || fd >= UFS_MAX_OPEN_FILES)
     {
@@ -2033,74 +2196,190 @@ int ufs_stat(const char *path, struct ufs_stat *st)
 
 int ufs_fsck(void)
 {
+    size_t bitmap_size;
+    uint8_t *shadow_bitmap;
+
+    int is_corrupted;
+
     if (disk == NULL)
     {
         errno = EINVAL;
         return -1;
     }
 
-    if (sb.magic != UFS_MAGIC || sb.total_inodes == 0 || sb.total_blocks == 0)
+    if (sb.magic != UFS_MAGIC ||
+        sb.total_inodes == 0 ||
+        sb.total_blocks == 0)
     {
-        fprintf(stderr, "fsck: Fatal error - Superblock is corrupted.\n");
+        fprintf(
+            stderr,
+            "fsck: Fatal error - Superblock is corrupted.\n"
+        );
+
         return -1;
     }
 
-    size_t bbmp_bytes = (size_t)sb.block_bitmap_blocks * UFS_BLOCK_SIZE;
-    uint8_t *shadow_bbmp = calloc(1, bbmp_bytes);
-    if (shadow_bbmp == NULL)
+    bitmap_size =
+        (size_t)sb.block_bitmap_blocks * UFS_BLOCK_SIZE;
+
+    shadow_bitmap = calloc(
+        1,
+        bitmap_size
+    );
+
+    if (shadow_bitmap == NULL)
     {
         errno = ENOMEM;
         return -1;
     }
 
-    for (uint64_t i = 0; i < sb.data_start; i++)
+    
+    for (uint64_t block = 0;
+         block < sb.data_start;
+         block++)
     {
-        shadow_bbmp[i / 8] |= (uint8_t)(1u << (i % 8));
+        shadow_bitmap[block / 8] |=
+            (uint8_t)(1u << (block % 8));
     }
 
-    for (uint32_t i = 0; i < sb.total_inodes; i++)
+ 
+    for (uint32_t inode_number = 0;
+         inode_number < sb.total_inodes;
+         inode_number++)
     {
-        struct ufs_inode ino;
-        if (read_inode(i, &ino) != 0)
+        struct ufs_inode inode;
+        int result;
+
+        result = read_inode(
+            inode_number,
+            &inode
+        );
+
+        if (result != 0)
         {
             continue;
         }
 
-        if (ino.used == 1)
+        if (inode.used != 1)
         {
-            for (int b = 0; b < 10; b++)
-            {
-                uint32_t blk = ino.direct_blocks[b];
+            continue;
+        }
 
-                if (blk >= sb.data_start && blk < sb.total_blocks)
+      
+        for (int i = 0; i < 10; i++)
+        {
+            uint32_t block;
+
+            block = inode.direct_blocks[i];
+
+            if (block >= sb.data_start &&
+                block < sb.total_blocks)
+            {
+                shadow_bitmap[block / 8] |=
+                    (uint8_t)(
+                        1u << (block % 8)
+                    );
+            }
+        }
+
+       
+        if (inode.indirect_block >= sb.data_start &&
+            inode.indirect_block < sb.total_blocks)
+        {
+            uint32_t block_numbers[
+                UFS_BLOCK_SIZE / sizeof(uint32_t)
+            ];
+
+            size_t block_count;
+            size_t i;
+
+          
+            shadow_bitmap[
+                inode.indirect_block / 8
+            ] |=
+                (uint8_t)(
+                    1u <<
+                    (inode.indirect_block % 8)
+                );
+
+         
+            result = disk_read_block(
+                inode.indirect_block,
+                block_numbers
+            );
+
+            if (result != 0)
+            {
+                continue;
+            }
+
+            block_count =
+                UFS_BLOCK_SIZE / sizeof(uint32_t);
+
+            for (i = 0;
+                 i < block_count;
+                 i++)
+            {
+                uint32_t block;
+
+                block = block_numbers[i];
+
+                if (block >= sb.data_start &&
+                    block < sb.total_blocks)
                 {
-                    shadow_bbmp[blk / 8] |= (uint8_t)(1u << (blk % 8));
+                    shadow_bitmap[
+                        block / 8
+                    ] |=
+                        (uint8_t)(
+                            1u <<
+                            (block % 8)
+                        );
                 }
             }
         }
     }
 
-    int is_corrupted = 0;
-    for (size_t i = 0; i < bbmp_bytes; i++)
+    
+    is_corrupted = 0;
+
+    for (size_t i = 0;
+         i < bitmap_size;
+         i++)
     {
-        if (block_bitmap[i] != shadow_bbmp[i])
+        if (block_bitmap[i] != shadow_bitmap[i])
         {
-            block_bitmap[i] = shadow_bbmp[i];
+            block_bitmap[i] = shadow_bitmap[i];
             is_corrupted = 1;
         }
     }
 
+    
     if (is_corrupted)
     {
-        flush_block_bitmap();
-        printf("fsck: File system repaired successfully (Orphaned blocks recovered).\n");
+        int result;
+
+        result = flush_block_bitmap();
+
+        if (result != 0)
+        {
+            free(shadow_bitmap);
+            return -1;
+        }
+
+        printf(
+            "fsck: File system repaired successfully "
+            "(Orphaned blocks recovered).\n"
+        );
     }
     else
     {
-        printf("fsck: File system is clean. No errors found.\n");
+        printf(
+            "fsck: File system is clean. "
+            "No errors found.\n"
+        );
     }
 
-    free(shadow_bbmp);
+    free(shadow_bitmap);
 
     return 0;
 }

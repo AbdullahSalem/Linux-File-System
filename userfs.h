@@ -52,11 +52,7 @@ extern "C"
     off_t ufs_seek(int fd, off_t offset, int whence);
     int ufs_truncate(const char *path, size_t size);
     int ufs_stat(const char *path, struct ufs_stat *st);
-
-    /*
-     * Runs a consistency check on the mounted file system.
-     * Returns 0 if system is clean/repaired, or -1 on unrecoverable error.
-     */
+    
     int ufs_fsck(void);
 
 #ifdef __cplusplus
