@@ -1221,19 +1221,194 @@ int ufs_listdir(const char *path, struct ufs_dirent *entries, size_t max_entries
     return (int)count;
 }
 
+
 int ufs_create(const char *path)
 {
-    (void)path;
-    errno = ENOSYS;
-    return -1;
+    if (require_mounted() != 0)
+    {
+        return -1;
+    }
+    if (validate_path(path) != 0)
+    {
+        return -1;
+    }
+    if (strcmp(path, "/") == 0)
+    {
+        /* The root directory always exists. */
+        errno = EEXIST;
+        return -1;
+    }
+
+
+    int parent_inum, target_inum;
+    char name[UFS_MAX_NAME + 1];
+
+
+    if (resolve_parent(path, &parent_inum, &target_inum, name) != 0)
+    {
+        return -1;
+    }
+    if (target_inum >= 0)
+    {
+        errno = EEXIST;
+        return -1;
+    }
+
+
+    struct ufs_inode parent;
+    if (read_inode((uint32_t)parent_inum, &parent) != 0)
+    {
+        return -1;
+    }
+    if (parent.data.directory.child_count >= 44)
+    {
+        errno = ENOSPC;
+        return -1;
+    }
+
+
+    int new_inum = alloc_inode();
+    if (new_inum < 0)
+    {
+        return -1; /* errno set by alloc_inode (ENOSPC) */
+    }
+
+
+    struct ufs_inode child;
+    memset(&child, 0, sizeof(child));
+    child.used = 1;
+    child.type = UFS_TYPE_FILE;
+    strncpy(child.name, name, UFS_MAX_NAME);
+    child.name[UFS_MAX_NAME] = '\0';
+    child.size = 0;
+    child.parent_inode = parent_inum;
+    child.permissions = 0;
+
+
+    time_t now = time(NULL);
+    child.created_at = (int64_t)now;
+    child.modified_at = (int64_t)now;
+    child.data_blocks = 0;
+    /* child.data.file.* already zeroed by memset above. */
+
+
+    if (write_inode((uint32_t)new_inum, &child) != 0)
+    {
+        free_inode_num((uint32_t)new_inum);
+        return -1;
+    }
+
+
+    if (dir_add_child(&parent, (uint32_t)new_inum) != 0)
+    {
+        free_inode_num((uint32_t)new_inum);
+        return -1; /* errno set by dir_add_child (ENOSPC) */
+    }
+
+
+    if (write_inode((uint32_t)parent_inum, &parent) != 0)
+    {
+        free_inode_num((uint32_t)new_inum);
+        return -1;
+    }
+
+
+    return 0;
 }
+
 
 int ufs_unlink(const char *path)
 {
-    (void)path;
-    errno = ENOSYS;
-    return -1;
+    if (require_mounted() != 0)
+    {
+        return -1;
+    }
+    if (validate_path(path) != 0)
+    {
+        return -1;
+    }
+    if (strcmp(path, "/") == 0)
+    {
+        errno = EISDIR;
+        return -1;
+    }
+
+
+    int parent_inum, target_inum;
+    char name[UFS_MAX_NAME + 1];
+
+
+    if (resolve_parent(path, &parent_inum, &target_inum, name) != 0)
+    {
+        return -1;
+    }
+    if (target_inum < 0)
+    {
+        errno = ENOENT;
+        return -1;
+    }
+
+
+    struct ufs_inode target;
+    if (read_inode((uint32_t)target_inum, &target) != 0)
+    {
+        return -1;
+    }
+    if (target.type == UFS_TYPE_DIR)
+    {
+        errno = EISDIR;
+        return -1;
+    }
+
+
+    /* Release every data block owned by the file. */
+    for (int i = 0; i < 10; i++)
+    {
+        if (target.data.file.direct_blocks[i] != 0)
+        {
+            free_data_block(target.data.file.direct_blocks[i]);
+        }
+    }
+    if (target.data.file.indirect_block != 0)
+    {
+        free_indirect_chain(target.data.file.indirect_block, 1);
+    }
+    if (target.data.file.double_indirect_block != 0)
+    {
+        free_indirect_chain(target.data.file.double_indirect_block, 2);
+    }
+    if (target.data.file.triple_indirect_block != 0)
+    {
+        free_indirect_chain(target.data.file.triple_indirect_block, 3);
+    }
+
+
+    /* Wipe and free the inode itself. */
+    memset(&target, 0, sizeof(target));
+    target.used = 0;
+    if (write_inode((uint32_t)target_inum, &target) != 0)
+    {
+        return -1;
+    }
+    free_inode_num((uint32_t)target_inum);
+
+
+    /* Remove the directory entry from the parent. */
+    struct ufs_inode parent;
+    if (read_inode((uint32_t)parent_inum, &parent) != 0)
+    {
+        return -1;
+    }
+    dir_remove_child(&parent, (uint32_t)target_inum);
+    if (write_inode((uint32_t)parent_inum, &parent) != 0)
+    {
+        return -1;
+    }
+
+
+    return 0;
 }
+
 
 // 4
 int ufs_open(const char *path, int flags)
