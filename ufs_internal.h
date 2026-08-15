@@ -13,6 +13,12 @@
 
 #define UFS_BITS_PER_BITMAP_BLOCK (UFS_BLOCK_SIZE * 8)
 
+#define UFS_INODE_FLAG_TRASHED       (1u << 0)
+#define UFS_INODE_FLAG_INLINE_DATA   (1u << 1)
+#define UFS_INODE_FLAG_SAFE_DELETE   (1u << 2)
+
+#define UFS_TRASH_EXPIRY_SECONDS     (7 * 24 * 60 * 60)
+
 
 struct ufs_superblock
 {
@@ -72,8 +78,13 @@ struct ufs_inode
     uint32_t indirect_block;
     uint32_t double_indirect_block;
     uint32_t triple_indirect_block;
-    
-    uint8_t reserved[128];
+
+    int64_t expiry_time;
+    uint32_t flags;
+    char tags[32];
+    uint32_t block_checksums[10];
+
+    uint8_t reserved[44];
 };
 
 

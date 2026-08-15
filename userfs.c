@@ -1360,7 +1360,6 @@ int ufs_unlink(const char *path)
 
     int found;
     int result;
-    int i;
 
     if (disk == NULL)
     {
@@ -1431,51 +1430,6 @@ int ufs_unlink(const char *path)
         return -1;
     }
 
-    for (i = 0; i < 10; i++)
-    {
-        if (target.direct_blocks[i] != 0)
-        {
-            free_block(
-                target.direct_blocks[i]);
-
-            target.direct_blocks[i] = 0;
-        }
-    }
-
-    if (target.indirect_block != 0)
-    {
-        uint32_t block_numbers[UFS_BLOCK_SIZE / sizeof(uint32_t)];
-
-        size_t count;
-        size_t j;
-
-        result = disk_read_block(
-            target.indirect_block,
-            block_numbers);
-
-        if (result != 0)
-        {
-            return -1;
-        }
-
-        count =
-            UFS_BLOCK_SIZE / sizeof(uint32_t);
-
-        for (j = 0; j < count; j++)
-        {
-            if (block_numbers[j] != 0)
-            {
-                free_block(
-                    block_numbers[j]);
-            }
-        }
-
-        free_block(
-            target.indirect_block);
-
-        target.indirect_block = 0;
-    }
-
     result = dir_remove_entry(
         &parent,
         name);
@@ -1496,22 +1450,12 @@ int ufs_unlink(const char *path)
         return -1;
     }
 
-    memset(
-        &target,
-        0,
-        sizeof(target));
+    target.flags |= UFS_INODE_FLAG_TRASHED;
+    target.expiry_time = (int64_t)time(NULL) + UFS_TRASH_EXPIRY_SECONDS;
 
     result = write_inode(
         target_inum,
         &target);
-
-    if (result != 0)
-    {
-        return -1;
-    }
-
-    result = free_inode(
-        target_inum);
 
     if (result != 0)
     {
@@ -2158,6 +2102,53 @@ int ufs_stat(const char *path, struct ufs_stat *st)
     return 0;
 }
 
+static int purge_trashed_inode(uint32_t inum, struct ufs_inode *ino)
+{
+    uint8_t zeros[UFS_BLOCK_SIZE];
+    memset(zeros, 0, sizeof(zeros));
+
+    for (int i = 0; i < 10; i++)
+    {
+        if (ino->direct_blocks[i] != 0)
+        {
+            disk_write_block(ino->direct_blocks[i], zeros);
+            free_block(ino->direct_blocks[i]);
+            ino->direct_blocks[i] = 0;
+        }
+    }
+
+    if (ino->indirect_block != 0)
+    {
+        uint32_t block_numbers[UFS_BLOCK_SIZE / sizeof(uint32_t)];
+        size_t count = UFS_BLOCK_SIZE / sizeof(uint32_t);
+
+        if (disk_read_block(ino->indirect_block, block_numbers) == 0)
+        {
+            for (size_t j = 0; j < count; j++)
+            {
+                if (block_numbers[j] != 0)
+                {
+                    disk_write_block(block_numbers[j], zeros);
+                    free_block(block_numbers[j]);
+                }
+            }
+        }
+
+        disk_write_block(ino->indirect_block, zeros);
+        free_block(ino->indirect_block);
+        ino->indirect_block = 0;
+    }
+
+    memset(ino, 0, sizeof(*ino));
+
+    if (write_inode(inum, ino) != 0)
+    {
+        return -1;
+    }
+
+    return free_inode(inum);
+}
+
 int ufs_fsck(void)
 {
     if (disk == NULL)
@@ -2170,6 +2161,32 @@ int ufs_fsck(void)
     {
         fprintf(stderr, "fsck: Fatal error - Superblock is corrupted.\n");
         return -1;
+    }
+
+    int64_t now = (int64_t)time(NULL);
+    uint32_t purged_count = 0;
+
+    for (uint32_t i = 0; i < sb.total_inodes; i++)
+    {
+        struct ufs_inode ino;
+        if (read_inode(i, &ino) != 0)
+            continue;
+
+        if (ino.used == 1 &&
+            (ino.flags & UFS_INODE_FLAG_TRASHED) &&
+            ino.expiry_time != 0 &&
+            ino.expiry_time <= now)
+        {
+            if (purge_trashed_inode(i, &ino) == 0)
+            {
+                purged_count++;
+            }
+        }
+    }
+
+    if (purged_count > 0)
+    {
+        printf("fsck: Purged %u expired file(s) from recycle bin.\n", purged_count);
     }
 
     size_t bbmp_bytes = (size_t)sb.block_bitmap_blocks * UFS_BLOCK_SIZE;
