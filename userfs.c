@@ -24,7 +24,6 @@ static struct ufs_superblock sb;
 
 static struct ufs_open_file open_files[UFS_MAX_OPEN_FILES];
 
-
 /* Bitmaps loaded in RAM */
 static uint8_t *inode_bitmap;
 static uint8_t *block_bitmap;
@@ -275,11 +274,11 @@ static void free_inode(uint32_t inum)
 
 /*
  * Allocate a free data block. Returns the ABSOLUTE block
- * number (already offset by sb.data_start).
+ * number.
  */
 static int64_t alloc_block(void)
 {
-    int64_t idx = bitmap_find_free(block_bitmap, sb.data_blocks);
+    int64_t idx = bitmap_find_free(block_bitmap, sb.total_blocks);
     if (idx < 0)
     {
         errno = ENOSPC;
@@ -296,25 +295,19 @@ static int64_t alloc_block(void)
 
     uint8_t zero[UFS_BLOCK_SIZE];
     memset(zero, 0, sizeof(zero));
-    disk_write_block(sb.data_start + (uint64_t)idx, zero);
+    disk_write_block((uint64_t)idx, zero);
 
-    return (int64_t)(sb.data_start + (uint64_t)idx);
+    return (int64_t)idx;
 }
 
 static void free_block(uint64_t abs_block_num)
 {
-    if (abs_block_num < sb.data_start)
+    if (abs_block_num < sb.data_start || abs_block_num >= sb.total_blocks)
     {
         return;
     }
 
-    uint64_t idx = abs_block_num - sb.data_start;
-    if (idx >= sb.data_blocks)
-    {
-        return;
-    }
-
-    bitmap_clear(block_bitmap, idx);
+    bitmap_clear(block_bitmap, abs_block_num);
     flush_block_bitmap();
 }
 
@@ -1082,20 +1075,19 @@ int ufs_unlink(const char *path)
     return -1;
 }
 
-
-//4
+// 4
 int ufs_open(const char *path, int flags)
 {
     uint32_t inode_number;
     int fd;
 
-    if (disk_fd == -1)
+    if (disk == NULL)
     {
         errno = EINVAL;
         return -1;
     }
 
-   inode_number = resolve_path(path); // resolve function needs an edit
+    inode_number = resolve_path(path); // resolve function needs an edit
 
     if (inode_number < 0)
     {
@@ -1120,7 +1112,7 @@ int ufs_open(const char *path, int flags)
     return -1;
 }
 
-//4
+// 4
 int ufs_close(int fd)
 {
     if (fd < 0 || fd >= UFS_MAX_OPEN_FILES)
@@ -1140,9 +1132,7 @@ int ufs_close(int fd)
     return 0;
 }
 
-
-
-//4
+// 4
 off_t ufs_seek(int fd, off_t offset, int whence)
 {
     off_t new_position;
@@ -1153,13 +1143,11 @@ off_t ufs_seek(int fd, off_t offset, int whence)
         return -1;
     }
 
-
     if (!open_files[fd].used)
     {
         errno = EBADF;
         return -1;
     }
-
 
     if (whence == SEEK_SET)
     {
@@ -1180,7 +1168,6 @@ off_t ufs_seek(int fd, off_t offset, int whence)
         return -1;
     }
 
-
     if (new_position < 0)
     {
         errno = EINVAL;
@@ -1191,8 +1178,6 @@ off_t ufs_seek(int fd, off_t offset, int whence)
 
     return new_position;
 }
-
-
 
 ssize_t ufs_read(int fd, void *buf, size_t count)
 {
@@ -1211,7 +1196,6 @@ ssize_t ufs_write(int fd, const void *buf, size_t count)
     errno = ENOSYS;
     return -1;
 }
-
 
 int ufs_truncate(const char *path, size_t size)
 {
