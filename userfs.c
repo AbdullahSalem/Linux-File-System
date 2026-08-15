@@ -12,56 +12,26 @@
 #include <fcntl.h>
 #include <stdint.h>
 
-/* =========================================================
- * Global Filesystem State
- * ========================================================= */
 
-/* Disk image currently mounted */
 static FILE *disk = NULL;
-
-/* Superblock loaded in RAM */
 static struct ufs_superblock sb;
-
 static struct ufs_open_file open_files[UFS_MAX_OPEN_FILES];
-
-/* Bitmaps loaded in RAM */
 static uint8_t *inode_bitmap;
 static uint8_t *block_bitmap;
 
-/* Currently opened files */
 
-/* =========================================================
- * Bitmap Helper Functions
- * ========================================================= */
-
-/*
- * Set a bit to 1.
- *
- * 1 = used
- * 0 = free
- */
 static void bitmap_set(uint8_t *bitmap, uint64_t index)
 {
-    bitmap[index / 8] |=
-        (uint8_t)(1u << (index % 8));
+    bitmap[index / 8] |= (uint8_t)(1u << (index % 8));
 }
 
-/*
- * Clear a bit to 0.
- */
+
 static void bitmap_clear(uint8_t *bitmap, uint64_t index)
 {
-    bitmap[index / 8] &=
-        (uint8_t)~(1u << (index % 8));
+    bitmap[index / 8] &=(uint8_t)~(1u << (index % 8));
 }
 
-/*
- * Check whether a bit is set.
- *
- * Returns:
- * 1 -> used
- * 0 -> free
- */
+
 static int bitmap_test(const uint8_t *bitmap,
                        uint64_t index)
 {
@@ -70,22 +40,13 @@ static int bitmap_test(const uint8_t *bitmap,
            1u;
 }
 
-/*
- * Calculate how many bitmap blocks
- * are required to represent 'count' objects.
- */
+
 static uint64_t bitmap_blocks_needed(uint64_t count)
 {
     return (count + UFS_BITS_PER_BITMAP_BLOCK - 1) / UFS_BITS_PER_BITMAP_BLOCK;
 }
 
-/*
- * Find the first free bit.
- *
- * Returns:
- * >= 0 -> free index
- * -1   -> no free object
- */
+
 static int64_t bitmap_find_free(const uint8_t *bitmap,
                                 uint64_t count)
 {
@@ -100,27 +61,31 @@ static int64_t bitmap_find_free(const uint8_t *bitmap,
     return -1;
 }
 
-/* =========================================================
- * Low Level Disk I/O
- * ========================================================= */
 
-/*
- * Read a single UFS_BLOCK_SIZE block from the mounted image.
- */
 static int disk_read_block(uint64_t block_num, void *buf)
 {
+    size_t bytes_read;
+    off_t offset;
+    int seek_result;
+
     if (disk == NULL)
     {
         errno = EBADF;
         return -1;
     }
 
-    if (fseeko(disk, (off_t)(block_num * UFS_BLOCK_SIZE), SEEK_SET) != 0)
+    offset = (off_t)(block_num * UFS_BLOCK_SIZE);
+
+    seek_result = fseeko(disk, offset, SEEK_SET);
+
+    if (seek_result != 0)
     {
         return -1;
     }
 
-    if (fread(buf, 1, UFS_BLOCK_SIZE, disk) != UFS_BLOCK_SIZE)
+    bytes_read = fread(buf, 1, UFS_BLOCK_SIZE, disk);
+
+    if (bytes_read != UFS_BLOCK_SIZE)
     {
         errno = EIO;
         return -1;
@@ -129,29 +94,40 @@ static int disk_read_block(uint64_t block_num, void *buf)
     return 0;
 }
 
-/*
- * Write a single UFS_BLOCK_SIZE block to the mounted image.
- */
+
 static int disk_write_block(uint64_t block_num, const void *buf)
 {
+    size_t bytes_written;
+    off_t offset;
+    int seek_result;
+    int flush_result;
+
     if (disk == NULL)
     {
         errno = EBADF;
         return -1;
     }
 
-    if (fseeko(disk, (off_t)(block_num * UFS_BLOCK_SIZE), SEEK_SET) != 0)
+    offset = (off_t)(block_num * UFS_BLOCK_SIZE);
+
+    seek_result = fseeko(disk, offset, SEEK_SET);
+
+    if (seek_result != 0)
     {
         return -1;
     }
 
-    if (fwrite(buf, 1, UFS_BLOCK_SIZE, disk) != UFS_BLOCK_SIZE)
+    bytes_written = fwrite(buf, 1, UFS_BLOCK_SIZE, disk);
+
+    if (bytes_written != UFS_BLOCK_SIZE)
     {
         errno = EIO;
         return -1;
     }
 
-    if (fflush(disk) != 0)
+    flush_result = fflush(disk);
+
+    if (flush_result != 0)
     {
         return -1;
     }
@@ -159,15 +135,24 @@ static int disk_write_block(uint64_t block_num, const void *buf)
     return 0;
 }
 
-/*
- * Persist the in-RAM inode bitmap back to disk.
- */
+
+
 static int flush_inode_bitmap(void)
 {
-    for (uint32_t i = 0; i < sb.inode_bitmap_blocks; i++)
+    uint32_t i;
+    uint64_t block_num;
+    uint8_t *buffer;
+    int write_result;
+
+    for (i = 0; i < sb.inode_bitmap_blocks; i++)
     {
-        if (disk_write_block(sb.inode_bitmap_start + i,
-                             inode_bitmap + (size_t)i * UFS_BLOCK_SIZE) != 0)
+        block_num = sb.inode_bitmap_start + i;
+
+        buffer = inode_bitmap + (size_t)i * UFS_BLOCK_SIZE;
+
+        write_result = disk_write_block(block_num, buffer);
+
+        if (write_result != 0)
         {
             return -1;
         }
@@ -176,15 +161,22 @@ static int flush_inode_bitmap(void)
     return 0;
 }
 
-/*
- * Persist the in-RAM block bitmap back to disk.
- */
 static int flush_block_bitmap(void)
 {
-    for (uint32_t i = 0; i < sb.block_bitmap_blocks; i++)
+    uint32_t i;
+    uint64_t block_num;
+    uint8_t *buffer;
+    int write_result;
+
+    for (i = 0; i < sb.block_bitmap_blocks; i++)
     {
-        if (disk_write_block(sb.block_bitmap_start + i,
-                             block_bitmap + (size_t)i * UFS_BLOCK_SIZE) != 0)
+        block_num = sb.block_bitmap_start + i;
+
+        buffer = block_bitmap + (size_t)i * UFS_BLOCK_SIZE;
+
+        write_result = disk_write_block(block_num, buffer);
+
+        if (write_result != 0)
         {
             return -1;
         }
@@ -193,89 +185,126 @@ static int flush_block_bitmap(void)
     return 0;
 }
 
-/* =========================================================
- * Inode Helpers
- * ========================================================= */
 
-#define UFS_INODES_PER_BLOCK (UFS_BLOCK_SIZE / sizeof(struct ufs_inode))
+#define UFS_INODES_PER_BLOCK \
+    (UFS_BLOCK_SIZE / sizeof(struct ufs_inode))
 
 static int read_inode(uint32_t inum, struct ufs_inode *out)
 {
+    uint64_t block;
+    uint32_t offset;
+    uint8_t buf[UFS_BLOCK_SIZE];
+    int read_result;
+
     if (inum >= sb.total_inodes)
     {
         errno = EINVAL;
         return -1;
     }
 
-    uint64_t block = sb.inode_table_start + inum / UFS_INODES_PER_BLOCK;
-    uint32_t offset = (inum % UFS_INODES_PER_BLOCK) * sizeof(struct ufs_inode);
+    block = sb.inode_table_start +
+            inum / UFS_INODES_PER_BLOCK;
 
-    uint8_t buf[UFS_BLOCK_SIZE];
-    if (disk_read_block(block, buf) != 0)
+    offset = (inum % UFS_INODES_PER_BLOCK) *
+             sizeof(struct ufs_inode);
+
+    read_result = disk_read_block(block, buf);
+
+    if (read_result != 0)
     {
         return -1;
     }
 
     memcpy(out, buf + offset, sizeof(struct ufs_inode));
+
     return 0;
 }
 
+
 static int write_inode(uint32_t inum, const struct ufs_inode *in)
 {
+    uint64_t block;
+    uint32_t offset;
+    uint8_t buf[UFS_BLOCK_SIZE];
+    int read_result;
+    int write_result;
+
     if (inum >= sb.total_inodes)
     {
         errno = EINVAL;
         return -1;
     }
 
-    uint64_t block = sb.inode_table_start + inum / UFS_INODES_PER_BLOCK;
-    uint32_t offset = (inum % UFS_INODES_PER_BLOCK) * sizeof(struct ufs_inode);
+    block = sb.inode_table_start +
+            inum / UFS_INODES_PER_BLOCK;
 
-    uint8_t buf[UFS_BLOCK_SIZE];
-    if (disk_read_block(block, buf) != 0)
+    offset = (inum % UFS_INODES_PER_BLOCK) *
+             sizeof(struct ufs_inode);
+
+    read_result = disk_read_block(block, buf);
+
+    if (read_result != 0)
     {
         return -1;
     }
 
     memcpy(buf + offset, in, sizeof(struct ufs_inode));
 
-    return disk_write_block(block, buf);
+    write_result = disk_write_block(block, buf);
+
+    if (write_result != 0)
+    {
+        return -1;
+    }
+
+    return 0;
 }
 
-/*
- * Allocate a free inode number. Marks it used in the bitmap
- * (and flushes the bitmap) but does NOT write inode contents.
- */
+
 static int64_t alloc_inode(void)
 {
-    int64_t idx = bitmap_find_free(inode_bitmap, sb.total_inodes);
-    if (idx < 0)
+    int64_t inum;
+    int flush_result;
+
+    inum = bitmap_find_free(inode_bitmap, sb.total_inodes);
+
+    if (inum < 0)
     {
         errno = ENOSPC;
         return -1;
     }
 
-    bitmap_set(inode_bitmap, (uint64_t)idx);
+    bitmap_set(inode_bitmap, (uint64_t)inum);
 
-    if (flush_inode_bitmap() != 0)
+    flush_result = flush_inode_bitmap();
+
+    if (flush_result != 0)
     {
-        bitmap_clear(inode_bitmap, (uint64_t)idx);
+        bitmap_clear(inode_bitmap, (uint64_t)inum);
         return -1;
     }
 
-    return idx;
+    return inum;
 }
 
-static void free_inode(uint32_t inum)
+static int free_inode(uint32_t inum)
 {
+    int flush_result;
+
     bitmap_clear(inode_bitmap, inum);
-    flush_inode_bitmap();
+
+    flush_result = flush_inode_bitmap();
+
+    if (flush_result != 0)
+    {
+        bitmap_set(inode_bitmap, inum);
+        return -1;
+    }
+
+    return 0;
 }
 
-/*
- * Allocate a free data block. Returns the ABSOLUTE block
- * number.
- */
+
 static int64_t alloc_block(void)
 {
     int64_t idx = bitmap_find_free(block_bitmap, sb.total_blocks);
@@ -311,104 +340,171 @@ static void free_block(uint64_t abs_block_num)
     flush_block_bitmap();
 }
 
-/* =========================================================
- * Directory Helpers
- *
- * A directory's contents live in its direct_blocks[] array
- * (indirect blocks are not used for directories in this
- * implementation, capping a directory at
- * 10 * UFS_DIRENTS_PER_BLOCK entries).
- * ========================================================= */
+
+static void set_dir_entry(struct ufs_disk_dirent *entry,
+                          const char *name,
+                          uint32_t inode)
+{
+    entry->used = 1;
+    entry->inode = inode;
+
+    strncpy(entry->name, name, UFS_MAX_NAME);
+    entry->name[UFS_MAX_NAME] = '\0';
+}
 
 static int dir_find_entry(const struct ufs_inode *dir,
                           const char *name,
                           uint32_t *out_inode)
 {
-    for (uint32_t b = 0; b < dir->block_count && b < 10; b++)
+    uint32_t block_index;
+    uint32_t entry_index;
+
+    uint8_t buffer[UFS_BLOCK_SIZE];
+
+    struct ufs_disk_dirent *entries;
+
+    int read_result;
+
+    for (block_index = 0;
+         block_index < dir->block_count && block_index < 10;
+         block_index++)
     {
-        if (dir->direct_blocks[b] == 0)
+        if (dir->direct_blocks[block_index] == 0)
         {
             continue;
         }
 
-        uint8_t buf[UFS_BLOCK_SIZE];
-        if (disk_read_block(dir->direct_blocks[b], buf) != 0)
+        read_result = disk_read_block(
+            dir->direct_blocks[block_index],
+            buffer
+        );
+
+        if (read_result != 0)
         {
             return -1;
         }
 
-        struct ufs_disk_dirent *entries = (struct ufs_disk_dirent *)buf;
-        for (unsigned e = 0; e < UFS_DIRENTS_PER_BLOCK; e++)
+        entries = (struct ufs_disk_dirent *)buffer;
+
+        for (entry_index = 0;
+             entry_index < UFS_DIRENTS_PER_BLOCK;
+             entry_index++)
         {
-            if (entries[e].used && strcmp(entries[e].name, name) == 0)
+            if (entries[entry_index].used == 0)
             {
-                if (out_inode)
-                {
-                    *out_inode = entries[e].inode;
-                }
-                return 1; /* found */
+                continue;
             }
+
+            if (strcmp(entries[entry_index].name, name) != 0)
+            {
+                continue;
+            }
+
+            if (out_inode != NULL)
+            {
+                *out_inode = entries[entry_index].inode;
+            }
+
+            return 1;
         }
     }
 
-    return 0; /* not found */
+    return 0;
 }
 
-/*
- * Add (name -> child_inum) to a directory. Updates and
- * persists `dir` (the parent inode) if a new block had to be
- * allocated.
- */
-static int dir_add_entry(uint32_t dir_inum, struct ufs_inode *dir,
-                         const char *name, uint32_t child_inum)
+
+static int dir_add_entry(uint32_t dir_inum,
+                         struct ufs_inode *dir,
+                         const char *name,
+                         uint32_t child_inum)
 {
-    /* Try to find a free slot in an already-allocated block. */
-    for (uint32_t b = 0; b < dir->block_count && b < 10; b++)
+    uint32_t block_index;
+    uint32_t entry_index;
+
+    uint8_t buffer[UFS_BLOCK_SIZE];
+
+    struct ufs_disk_dirent *entries;
+
+    int read_result;
+    int write_result;
+
+    int64_t new_block;
+
+    for (block_index = 0;
+         block_index < dir->block_count && block_index < 10;
+         block_index++)
     {
-        uint8_t buf[UFS_BLOCK_SIZE];
-        if (disk_read_block(dir->direct_blocks[b], buf) != 0)
+        if (dir->direct_blocks[block_index] == 0)
+        {
+            continue;
+        }
+
+        read_result = disk_read_block(
+            dir->direct_blocks[block_index],
+            buffer
+        );
+
+        if (read_result != 0)
         {
             return -1;
         }
 
-        struct ufs_disk_dirent *entries = (struct ufs_disk_dirent *)buf;
-        for (unsigned e = 0; e < UFS_DIRENTS_PER_BLOCK; e++)
-        {
-            if (!entries[e].used)
-            {
-                entries[e].used = 1;
-                entries[e].inode = child_inum;
-                strncpy(entries[e].name, name, UFS_MAX_NAME);
-                entries[e].name[UFS_MAX_NAME] = '\0';
+        entries = (struct ufs_disk_dirent *)buffer;
 
-                return disk_write_block(dir->direct_blocks[b], buf);
+        for (entry_index = 0;
+             entry_index < UFS_DIRENTS_PER_BLOCK;
+             entry_index++)
+        {
+            if (entries[entry_index].used != 0)
+            {
+                continue;
             }
+
+            set_dir_entry(
+                &entries[entry_index],
+                name,
+                child_inum
+            );
+
+            write_result = disk_write_block(
+                dir->direct_blocks[block_index],
+                buffer
+            );
+
+            return write_result;
         }
     }
 
-    /* No free slot: allocate a new block, if there's room for one. */
+    
     if (dir->block_count >= 10)
     {
         errno = ENOSPC;
         return -1;
     }
 
-    int64_t new_block = alloc_block();
+    new_block = alloc_block();
+
     if (new_block < 0)
     {
         return -1;
     }
 
-    uint8_t buf[UFS_BLOCK_SIZE];
-    memset(buf, 0, sizeof(buf));
+    memset(buffer, 0, sizeof(buffer));
 
-    struct ufs_disk_dirent *entries = (struct ufs_disk_dirent *)buf;
-    entries[0].used = 1;
-    entries[0].inode = child_inum;
-    strncpy(entries[0].name, name, UFS_MAX_NAME);
-    entries[0].name[UFS_MAX_NAME] = '\0';
+    entries = (struct ufs_disk_dirent *)buffer;
 
-    if (disk_write_block((uint64_t)new_block, buf) != 0)
+    set_dir_entry(
+        &entries[0],
+        name,
+        child_inum
+    );
+
+    write_result = disk_write_block(
+        (uint64_t)new_block,
+        buffer
+    );
+
+    if (write_result != 0)
     {
         free_block((uint64_t)new_block);
         return -1;
@@ -417,32 +513,77 @@ static int dir_add_entry(uint32_t dir_inum, struct ufs_inode *dir,
     dir->direct_blocks[dir->block_count] = (uint32_t)new_block;
     dir->block_count++;
 
-    return write_inode(dir_inum, dir);
+    write_result = write_inode(dir_inum, dir);
+
+    if (write_result != 0)
+    {
+        return -1;
+    }
+
+    return 0;
 }
 
-static int dir_remove_entry(struct ufs_inode *dir, const char *name)
+
+static int dir_remove_entry(struct ufs_inode *dir,
+                            const char *name)
 {
-    for (uint32_t b = 0; b < dir->block_count && b < 10; b++)
+    uint32_t block_index;
+    uint32_t entry_index;
+
+    uint8_t buffer[UFS_BLOCK_SIZE];
+
+    struct ufs_disk_dirent *entries;
+
+    int read_result;
+    int write_result;
+
+    for (block_index = 0;
+         block_index < dir->block_count && block_index < 10;
+         block_index++)
     {
-        if (dir->direct_blocks[b] == 0)
+        if (dir->direct_blocks[block_index] == 0)
         {
             continue;
         }
 
-        uint8_t buf[UFS_BLOCK_SIZE];
-        if (disk_read_block(dir->direct_blocks[b], buf) != 0)
+        read_result = disk_read_block(
+            dir->direct_blocks[block_index],
+            buffer
+        );
+
+        if (read_result != 0)
         {
             return -1;
         }
 
-        struct ufs_disk_dirent *entries = (struct ufs_disk_dirent *)buf;
-        for (unsigned e = 0; e < UFS_DIRENTS_PER_BLOCK; e++)
+        entries = (struct ufs_disk_dirent *)buffer;
+
+        for (entry_index = 0;
+             entry_index < UFS_DIRENTS_PER_BLOCK;
+             entry_index++)
         {
-            if (entries[e].used && strcmp(entries[e].name, name) == 0)
+            if (entries[entry_index].used == 0)
             {
-                memset(&entries[e], 0, sizeof(entries[e]));
-                return disk_write_block(dir->direct_blocks[b], buf);
+                continue;
             }
+
+            if (strcmp(entries[entry_index].name, name) != 0)
+            {
+                continue;
+            }
+
+            memset(
+                &entries[entry_index],
+                0,
+                sizeof(entries[entry_index])
+            );
+
+            write_result = disk_write_block(
+                dir->direct_blocks[block_index],
+                buffer
+            );
+
+            return write_result;
         }
     }
 
@@ -450,26 +591,44 @@ static int dir_remove_entry(struct ufs_inode *dir, const char *name)
     return -1;
 }
 
+
 static int dir_is_empty(const struct ufs_inode *dir)
 {
-    for (uint32_t b = 0; b < dir->block_count && b < 10; b++)
+    uint32_t block_index;
+    uint32_t entry_index;
+
+    uint8_t buffer[UFS_BLOCK_SIZE];
+
+    struct ufs_disk_dirent *entries;
+
+    int read_result;
+
+    for (block_index = 0;
+         block_index < dir->block_count && block_index < 10;
+         block_index++)
     {
-        if (dir->direct_blocks[b] == 0)
+        if (dir->direct_blocks[block_index] == 0)
         {
             continue;
         }
 
-        uint8_t buf[UFS_BLOCK_SIZE];
-        if (disk_read_block(dir->direct_blocks[b], buf) != 0)
+        read_result = disk_read_block(
+            dir->direct_blocks[block_index],
+            buffer
+        );
+
+        if (read_result != 0)
         {
-            /* Treat unreadable block as non-empty to be safe. */
             return 0;
         }
 
-        struct ufs_disk_dirent *entries = (struct ufs_disk_dirent *)buf;
-        for (unsigned e = 0; e < UFS_DIRENTS_PER_BLOCK; e++)
+        entries = (struct ufs_disk_dirent *)buffer;
+
+        for (entry_index = 0;
+             entry_index < UFS_DIRENTS_PER_BLOCK;
+             entry_index++)
         {
-            if (entries[e].used)
+            if (entries[entry_index].used != 0)
             {
                 return 0;
             }
@@ -479,16 +638,21 @@ static int dir_is_empty(const struct ufs_inode *dir)
     return 1;
 }
 
-/* =========================================================
- * Path Resolution
- * ========================================================= */
 
-/*
- * Resolve `path` to an inode number.
- * "/" resolves to the root inode.
- */
+
 static int resolve_path(const char *path, uint32_t *out_inode)
 {
+    uint32_t current_inode;
+    uint32_t next_inode;
+
+    char copy[UFS_MAX_PATH + 1];
+    char *token;
+    char *save_ptr;
+
+    struct ufs_inode current;
+
+    int found;
+
     if (path == NULL || path[0] != '/')
     {
         errno = EINVAL;
@@ -501,72 +665,82 @@ static int resolve_path(const char *path, uint32_t *out_inode)
         return -1;
     }
 
-    uint32_t current = sb.root_inode;
+    current_inode = sb.root_inode;
 
     if (strcmp(path, "/") == 0)
     {
-        *out_inode = current;
+        *out_inode = current_inode;
         return 0;
     }
 
-    char copy[UFS_MAX_PATH + 1];
-    strncpy(copy, path, sizeof(copy) - 1);
-    copy[sizeof(copy) - 1] = '\0';
+    strcpy(copy, path);
 
-    char *saveptr = NULL;
-    char *tok = strtok_r(copy, "/", &saveptr);
+    save_ptr = NULL;
+    token = strtok_r(copy, "/", &save_ptr);
 
-    while (tok != NULL)
+    while (token != NULL)
     {
-        struct ufs_inode cur_inode;
-        if (read_inode(current, &cur_inode) != 0)
+        int read_result;
+
+        read_result = read_inode(current_inode, &current);
+
+        if (read_result != 0)
         {
             return -1;
         }
 
-        if (cur_inode.type != UFS_TYPE_DIR)
+        if (current.type != UFS_TYPE_DIR)
         {
             errno = ENOTDIR;
             return -1;
         }
 
-        uint32_t next;
-        int found = dir_find_entry(&cur_inode, tok, &next);
+        found = dir_find_entry(
+            &current,
+            token,
+            &next_inode
+        );
+
         if (found < 0)
         {
             return -1;
         }
+
         if (found == 0)
         {
             errno = ENOENT;
             return -1;
         }
 
-        current = next;
-        tok = strtok_r(NULL, "/", &saveptr);
+        current_inode = next_inode;
+
+        token = strtok_r(NULL, "/", &save_ptr);
     }
 
-    *out_inode = current;
+    *out_inode = current_inode;
+
     return 0;
 }
 
-/*
- * Split `path` into its parent directory (resolved to an
- * inode number) and the final path component (copied into
- * `name_out`, which must hold at least UFS_MAX_NAME + 1
- * bytes).
- */
-static int resolve_parent(const char *path, uint32_t *parent_inode,
+static int resolve_parent(const char *path,
+                          uint32_t *parent_inode,
                           char *name_out)
 {
+    char copy[UFS_MAX_PATH + 1];
+
+    char *slash;
+
+    size_t length;
+
     if (path == NULL || path[0] != '/')
     {
         errno = EINVAL;
         return -1;
     }
 
-    size_t len = strlen(path);
-    if (len == 0 || len > UFS_MAX_PATH)
+    length = strlen(path);
+
+    if (length == 0 || length > UFS_MAX_PATH)
     {
         errno = EINVAL;
         return -1;
@@ -574,52 +748,81 @@ static int resolve_parent(const char *path, uint32_t *parent_inode,
 
     if (strcmp(path, "/") == 0)
     {
-        /* The root has no parent. */
         errno = EINVAL;
         return -1;
     }
 
-    char copy[UFS_MAX_PATH + 1];
-    strncpy(copy, path, sizeof(copy) - 1);
-    copy[sizeof(copy) - 1] = '\0';
+    strcpy(copy, path);
 
-    /* Strip a single trailing slash, if present (e.g. "/a/b/"). */
-    size_t clen = strlen(copy);
-    if (clen > 1 && copy[clen - 1] == '/')
+    length = strlen(copy);
+
+    if (length > 1 && copy[length - 1] == '/')
     {
-        copy[clen - 1] = '\0';
+        copy[length - 1] = '\0';
     }
 
-    char *slash = strrchr(copy, '/');
+    slash = strrchr(copy, '/');
+
     if (slash == NULL)
     {
         errno = EINVAL;
         return -1;
     }
 
-    const char *name = slash + 1;
-    if (strlen(name) == 0 || strlen(name) > UFS_MAX_NAME)
+  
+    strcpy(name_out, slash + 1);
+
+    if (strlen(name_out) == 0 ||
+        strlen(name_out) > UFS_MAX_NAME)
     {
         errno = ENAMETOOLONG;
         return -1;
     }
 
-    strcpy(name_out, name);
-
     if (slash == copy)
     {
-        /* Parent is the root, e.g. "/foo". */
         *parent_inode = sb.root_inode;
         return 0;
     }
-
+    
     *slash = '\0';
+
     return resolve_path(copy, parent_inode);
 }
 
-/* =========================================================
- * Filesystem API
- * ========================================================= */
+int32_t ufs_get_file_size(int fd)
+{
+    uint32_t inode_number;
+    struct ufs_inode inode;
+    int result;
+
+    if (fd < 0 || fd >= UFS_MAX_OPEN_FILES)
+    {
+        errno = EBADF;
+        return -1;
+    }
+
+    if (!open_files[fd].used)
+    {
+        errno = EBADF;
+        return -1;
+    }
+
+    inode_number = open_files[fd].inode_number;
+
+    result = read_inode(inode_number, &inode);
+
+    if (result != 0)
+    {
+        return -1;
+    }
+
+    return (int32_t)inode.size;
+}
+
+
+//Filesystem API
+
 
 int ufs_format(const char *image_path, size_t image_size)
 {
@@ -637,7 +840,7 @@ int ufs_format(const char *image_path, size_t image_size)
 
     uint64_t total_blocks = image_size / UFS_BLOCK_SIZE;
 
-    /* Zero-fill the whole image up front. */
+
     uint8_t zero[UFS_BLOCK_SIZE];
     memset(zero, 0, sizeof(zero));
     for (uint64_t i = 0; i < total_blocks; i++)
@@ -693,14 +896,14 @@ int ufs_format(const char *image_path, size_t image_size)
     new_sb.data_blocks = total_blocks - new_sb.data_start;
     new_sb.root_inode = 0;
 
-    /* Write superblock (block 0). */
+
     uint8_t sb_block[UFS_BLOCK_SIZE];
     memset(sb_block, 0, sizeof(sb_block));
     memcpy(sb_block, &new_sb, sizeof(new_sb));
     fseeko(f, 0, SEEK_SET);
     fwrite(sb_block, 1, UFS_BLOCK_SIZE, f);
 
-    /* Build and write the inode bitmap: inode 0 (root) is used. */
+
     size_t ibmp_bytes = (size_t)new_sb.inode_bitmap_blocks * UFS_BLOCK_SIZE;
     uint8_t *ibmp = calloc(1, ibmp_bytes);
     ibmp[0] |= 0x1;
@@ -709,8 +912,7 @@ int ufs_format(const char *image_path, size_t image_size)
     fwrite(ibmp, 1, ibmp_bytes, f);
     free(ibmp);
 
-    /* Build and write the block bitmap: all metadata blocks
-     * (everything before data_start) are marked used. */
+    
     size_t bbmp_bytes = (size_t)new_sb.block_bitmap_blocks * UFS_BLOCK_SIZE;
     uint8_t *bbmp = calloc(1, bbmp_bytes);
     for (uint64_t i = 0; i < new_sb.data_start; i++)
@@ -722,7 +924,7 @@ int ufs_format(const char *image_path, size_t image_size)
     fwrite(bbmp, 1, bbmp_bytes, f);
     free(bbmp);
 
-    /* Write inode table: inode 0 is the root directory. */
+
     struct ufs_inode root;
     memset(&root, 0, sizeof(root));
     root.used = 1;
@@ -884,8 +1086,6 @@ int ufs_mkdir(const char *path)
         return -1;
     }
 
-    /* re-read parent since dir_add_entry may have allocated a
-     * block for a previous, unrelated operation in between */
     if (dir_add_entry(parent_inum, &parent, name, (uint32_t)new_inum) != 0)
     {
         int saved_errno = errno;
@@ -1075,21 +1275,23 @@ int ufs_unlink(const char *path)
     return -1;
 }
 
-// 4
+
+//4
 int ufs_open(const char *path, int flags)
 {
     uint32_t inode_number;
     int fd;
+    int result;
 
-    if (disk == NULL)
+    if (disk_fd == -1)
     {
         errno = EINVAL;
         return -1;
     }
 
-    inode_number = resolve_path(path); // resolve function needs an edit
+    result = resolve_path(path, &inode_number);
 
-    if (inode_number < 0)
+    if (result != 0)
     {
         errno = ENOENT;
         return -1;
@@ -1112,7 +1314,7 @@ int ufs_open(const char *path, int flags)
     return -1;
 }
 
-// 4
+//4
 int ufs_close(int fd)
 {
     if (fd < 0 || fd >= UFS_MAX_OPEN_FILES)
@@ -1132,10 +1334,12 @@ int ufs_close(int fd)
     return 0;
 }
 
-// 4
+
+//4
 off_t ufs_seek(int fd, off_t offset, int whence)
 {
     off_t new_position;
+    int32_t file_size;
 
     if (fd < 0 || fd >= UFS_MAX_OPEN_FILES)
     {
@@ -1159,7 +1363,13 @@ off_t ufs_seek(int fd, off_t offset, int whence)
     }
     else if (whence == SEEK_END)
     {
-        // cannot get file size
+        file_size = ufs_get_file_size(fd);
+
+        if (file_size < 0)
+        {
+            return -1;
+        }
+
         new_position = file_size + offset;
     }
     else
@@ -1179,6 +1389,8 @@ off_t ufs_seek(int fd, off_t offset, int whence)
     return new_position;
 }
 
+
+
 ssize_t ufs_read(int fd, void *buf, size_t count)
 {
       if (disk == NULL)
@@ -1193,8 +1405,7 @@ ssize_t ufs_read(int fd, void *buf, size_t count)
         return -1;
     }
 
-    /* UFS_O_RDONLY=0x1, UFS_O_WRONLY=0x2, UFS_O_RDWR=0x3.
-     * flags & UFS_O_RDONLY is nonzero for both RDONLY and RDWR. */
+
     if (!(open_files[fd].flags & UFS_O_RDONLY))
     {
         errno = EBADF;
@@ -1221,13 +1432,10 @@ ssize_t ufs_read(int fd, void *buf, size_t count)
 
     off_t offset = open_files[fd].position;
 
-    /* EOF guard must come BEFORE the subtraction below: offset can
-     * legitimately exceed inode.size (e.g. after a seek past EOF),
-     * and inode.size - offset would underflow (these are unsigned)
-     * if we didn't check this first. */
+
     if ((uint64_t)offset >= inode.size)
     {
-        return 0; /* EOF, not an error */
+        return 0; 
     }
 
     uint64_t available = inode.size - (uint64_t)offset;
@@ -1243,9 +1451,7 @@ ssize_t ufs_read(int fd, void *buf, size_t count)
         uint32_t block_index = (uint32_t)(cur / UFS_BLOCK_SIZE);
         uint32_t in_block_off = (uint32_t)(cur % UFS_BLOCK_SIZE);
 
-        /* Resolve block_index -> physical block number:
-         * direct_blocks[0..9] first, then the single
-         * indirect_block for anything beyond that. */
+
         uint32_t disk_block = 0;
         if (block_index < 10)
         {
@@ -1272,8 +1478,7 @@ ssize_t ufs_read(int fd, void *buf, size_t count)
 
         if (disk_block == 0)
         {
-            /* A hole: this range was never written. Treat as zeros
-             * rather than reading garbage or failing. */
+     
             memset(block_buf, 0, UFS_BLOCK_SIZE);
         }
         else if (disk_read_block(disk_block, block_buf) != 0)
@@ -1311,8 +1516,6 @@ ssize_t ufs_write(int fd, const void *buf, size_t count)
         return -1;
     }
 
-    /* UFS_O_WRONLY=0x2, UFS_O_RDWR=0x3.
-     * flags & UFS_O_WRONLY is nonzero for both WRONLY and RDWR. */
     if (!(open_files[fd].flags & UFS_O_WRONLY))
     {
         errno = EBADF;
@@ -1346,8 +1549,7 @@ ssize_t ufs_write(int fd, const void *buf, size_t count)
     off_t start_offset = open_files[fd].position;
     if (open_files[fd].flags & UFS_O_APPEND)
     {
-        /* Always append at the CURRENT end of file, not wherever
-         * the fd's position happens to be. */
+
         start_offset = (off_t)inode.size;
     }
 
@@ -1361,10 +1563,6 @@ ssize_t ufs_write(int fd, const void *buf, size_t count)
         uint32_t block_index = (uint32_t)(cur / UFS_BLOCK_SIZE);
         uint32_t in_block_off = (uint32_t)(cur % UFS_BLOCK_SIZE);
 
-        /* Resolve block_index -> physical block number,
-         * allocating on the fly if it doesn't exist yet:
-         * direct_blocks[0..9] first, then the single
-         * indirect_block for anything beyond that. */
         uint32_t disk_block = 0;
         if (block_index < 10)
         {
@@ -1373,7 +1571,7 @@ ssize_t ufs_write(int fd, const void *buf, size_t count)
                 int64_t nb = alloc_block();
                 if (nb < 0)
                 {
-                    break; /* ENOSPC: stop, keep partial progress */
+                    break; 
                 }
                 inode.direct_blocks[block_index] = (uint32_t)nb;
             }
@@ -1394,8 +1592,7 @@ ssize_t ufs_write(int fd, const void *buf, size_t count)
                 {
                     break;
                 }
-                /* alloc_block() already zero-fills the new block on
-                 * disk, so the pointer table starts all-zero. */
+            
                 inode.indirect_block = (uint32_t)nb;
             }
             uint32_t ptrs[UFS_BLOCK_SIZE / sizeof(uint32_t)];
@@ -1426,9 +1623,7 @@ ssize_t ufs_write(int fd, const void *buf, size_t count)
             chunk = remaining;
         }
 
-        /* Read-modify-write: only needed when NOT overwriting an
-         * entire block, since the disk can't be told to touch just
-         * part of a block. */
+
         if (chunk < UFS_BLOCK_SIZE)
         {
             if (disk_read_block(disk_block, block_buf) != 0)
@@ -1454,10 +1649,7 @@ ssize_t ufs_write(int fd, const void *buf, size_t count)
     }
     inode.modified_at = (int64_t)time(NULL);
 
-    /* Persist size + any newly-populated direct_blocks[]/
-     * indirect_block pointers set above. If even this fails and
-     * nothing was written, report failure; if some bytes did make
-     * it to disk, still report that progress. */
+
     if (write_inode(inum, &inode) != 0 && bytes_done == 0)
     {
         return -1;
@@ -1467,9 +1659,7 @@ ssize_t ufs_write(int fd, const void *buf, size_t count)
 
     if (bytes_done == 0 && count > 0)
     {
-        /* errno was already set by whichever call above failed
-         * (alloc_block -> ENOSPC, indirect range -> EFBIG, or
-         * disk I/O -> EIO). */
+
         return -1;
     }
 
@@ -1506,14 +1696,13 @@ int ufs_truncate(const char *path, size_t size)
     uint64_t new_size = (uint64_t)size;
     const uint32_t ptrs_per_block = UFS_BLOCK_SIZE / sizeof(uint32_t);
 
-    /* Number of blocks needed to hold `n` bytes, i.e. ceil(n / UFS_BLOCK_SIZE). */
+
     uint32_t old_blocks = (uint32_t)((inode.size + UFS_BLOCK_SIZE - 1) / UFS_BLOCK_SIZE);
     uint32_t new_blocks = (uint32_t)((new_size + UFS_BLOCK_SIZE - 1) / UFS_BLOCK_SIZE);
 
     if (new_size < inode.size)
     {
-        /* SHRINKING: free every block index in [new_blocks, old_blocks)
-         * and clear the inode's pointer to each one. */
+      
         for (uint32_t bi = new_blocks; bi < old_blocks; bi++)
         {
             uint32_t disk_block = 0;
@@ -1555,9 +1744,6 @@ int ufs_truncate(const char *path, size_t size)
             }
         }
 
-        /* If shrinking dropped back to direct-block range entirely
-         * and the indirect block no longer points to anything real,
-         * free the indirect block itself too. */
         if (inode.indirect_block != 0 && new_blocks <= 10)
         {
             uint32_t ptrs[UFS_BLOCK_SIZE / sizeof(uint32_t)];
@@ -1582,13 +1768,7 @@ int ufs_truncate(const char *path, size_t size)
     }
     else if (new_size > inode.size)
     {
-        /* GROWING.
-         *
-         * First: if the OLD size didn't end exactly on a block
-         * boundary, the tail of that last block may hold stale
-         * bytes left over from an earlier, larger write that was
-         * since shrunk. Zero that tail explicitly so a later read
-         * of the newly-grown region returns zeros, not leftovers. */
+        
         uint32_t old_tail_off = (uint32_t)(inode.size % UFS_BLOCK_SIZE);
         if (inode.size > 0 && old_tail_off != 0)
         {
@@ -1625,8 +1805,6 @@ int ufs_truncate(const char *path, size_t size)
             }
         }
 
-        /* Then: allocate and zero-fill every wholly-new block
-         * needed to reach the new size. */
         uint8_t zeros[UFS_BLOCK_SIZE];
         memset(zeros, 0, sizeof(zeros));
 
@@ -1731,10 +1909,7 @@ int ufs_stat(const char *path, struct ufs_stat *st)
     return 0;
 }
 
-/*
- * Mini-fsck: Runs a consistency check on the mounted file system.
- * Rebuilds the block bitmap based on actual inode usage to recover orphaned blocks.
- */
+ 
 int ufs_fsck(void)
 {
     if (disk == NULL)
