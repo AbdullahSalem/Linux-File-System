@@ -1233,3 +1233,81 @@ int ufs_stat(const char *path, struct ufs_stat *st)
 
     return 0;
 }
+
+/*
+ * Mini-fsck: Runs a consistency check on the mounted file system.
+ * Rebuilds the block bitmap based on actual inode usage to recover orphaned blocks.
+ */
+int ufs_fsck(void)
+{
+    if (disk == NULL)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    if (sb.magic != UFS_MAGIC || sb.total_inodes == 0 || sb.total_blocks == 0)
+    {
+        fprintf(stderr, "fsck: Fatal error - Superblock is corrupted.\n");
+        return -1;
+    }
+
+    size_t bbmp_bytes = (size_t)sb.block_bitmap_blocks * UFS_BLOCK_SIZE;
+    uint8_t *shadow_bbmp = calloc(1, bbmp_bytes);
+    if (shadow_bbmp == NULL)
+    {
+        errno = ENOMEM;
+        return -1;
+    }
+
+    for (uint64_t i = 0; i < sb.data_start; i++)
+    {
+        shadow_bbmp[i / 8] |= (uint8_t)(1u << (i % 8));
+    }
+
+    for (uint32_t i = 0; i < sb.total_inodes; i++)
+    {
+        struct ufs_inode ino;
+        if (read_inode(i, &ino) != 0)
+        {
+            continue;
+        }
+
+        if (ino.used == 1)
+        {
+            for (int b = 0; b < 10; b++)
+            {
+                uint32_t blk = ino.direct_blocks[b];
+
+                if (blk >= sb.data_start && blk < sb.total_blocks)
+                {
+                    shadow_bbmp[blk / 8] |= (uint8_t)(1u << (blk % 8));
+                }
+            }
+        }
+    }
+
+    int is_corrupted = 0;
+    for (size_t i = 0; i < bbmp_bytes; i++)
+    {
+        if (block_bitmap[i] != shadow_bbmp[i])
+        {
+            block_bitmap[i] = shadow_bbmp[i];
+            is_corrupted = 1;
+        }
+    }
+
+    if (is_corrupted)
+    {
+        flush_block_bitmap();
+        printf("fsck: File system repaired successfully (Orphaned blocks recovered).\n");
+    }
+    else
+    {
+        printf("fsck: File system is clean. No errors found.\n");
+    }
+
+    free(shadow_bbmp);
+
+    return 0;
+}
