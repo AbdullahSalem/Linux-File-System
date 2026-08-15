@@ -12,25 +12,21 @@
 #include <fcntl.h>
 #include <stdint.h>
 
-
 static FILE *disk = NULL;
 static struct ufs_superblock sb;
 static struct ufs_open_file open_files[UFS_MAX_OPEN_FILES];
 static uint8_t *inode_bitmap;
 static uint8_t *block_bitmap;
 
-
 static void bitmap_set(uint8_t *bitmap, uint64_t index)
 {
     bitmap[index / 8] |= (uint8_t)(1u << (index % 8));
 }
 
-
 static void bitmap_clear(uint8_t *bitmap, uint64_t index)
 {
-    bitmap[index / 8] &=(uint8_t)~(1u << (index % 8));
+    bitmap[index / 8] &= (uint8_t)~(1u << (index % 8));
 }
-
 
 static int bitmap_test(const uint8_t *bitmap,
                        uint64_t index)
@@ -40,12 +36,10 @@ static int bitmap_test(const uint8_t *bitmap,
            1u;
 }
 
-
 static uint64_t bitmap_blocks_needed(uint64_t count)
 {
     return (count + UFS_BITS_PER_BITMAP_BLOCK - 1) / UFS_BITS_PER_BITMAP_BLOCK;
 }
-
 
 static int64_t bitmap_find_free(const uint8_t *bitmap,
                                 uint64_t count)
@@ -60,7 +54,6 @@ static int64_t bitmap_find_free(const uint8_t *bitmap,
 
     return -1;
 }
-
 
 static int disk_read_block(uint64_t block_num, void *buf)
 {
@@ -93,7 +86,6 @@ static int disk_read_block(uint64_t block_num, void *buf)
 
     return 0;
 }
-
 
 static int disk_write_block(uint64_t block_num, const void *buf)
 {
@@ -134,8 +126,6 @@ static int disk_write_block(uint64_t block_num, const void *buf)
 
     return 0;
 }
-
-
 
 static int flush_inode_bitmap(void)
 {
@@ -185,7 +175,6 @@ static int flush_block_bitmap(void)
     return 0;
 }
 
-
 #define UFS_INODES_PER_BLOCK \
     (UFS_BLOCK_SIZE / sizeof(struct ufs_inode))
 
@@ -219,7 +208,6 @@ static int read_inode(uint32_t inum, struct ufs_inode *out)
 
     return 0;
 }
-
 
 static int write_inode(uint32_t inum, const struct ufs_inode *in)
 {
@@ -259,7 +247,6 @@ static int write_inode(uint32_t inum, const struct ufs_inode *in)
 
     return 0;
 }
-
 
 static int64_t alloc_inode(void)
 {
@@ -304,7 +291,6 @@ static int free_inode(uint32_t inum)
     return 0;
 }
 
-
 static int64_t alloc_block(void)
 {
     int64_t idx = bitmap_find_free(block_bitmap, sb.total_blocks);
@@ -339,7 +325,6 @@ static void free_block(uint64_t abs_block_num)
     bitmap_clear(block_bitmap, abs_block_num);
     flush_block_bitmap();
 }
-
 
 static void set_dir_entry(struct ufs_disk_dirent *entry,
                           const char *name,
@@ -376,8 +361,7 @@ static int dir_find_entry(const struct ufs_inode *dir,
 
         read_result = disk_read_block(
             dir->direct_blocks[block_index],
-            buffer
-        );
+            buffer);
 
         if (read_result != 0)
         {
@@ -412,7 +396,6 @@ static int dir_find_entry(const struct ufs_inode *dir,
     return 0;
 }
 
-
 static int dir_add_entry(uint32_t dir_inum,
                          struct ufs_inode *dir,
                          const char *name,
@@ -441,8 +424,7 @@ static int dir_add_entry(uint32_t dir_inum,
 
         read_result = disk_read_block(
             dir->direct_blocks[block_index],
-            buffer
-        );
+            buffer);
 
         if (read_result != 0)
         {
@@ -463,19 +445,16 @@ static int dir_add_entry(uint32_t dir_inum,
             set_dir_entry(
                 &entries[entry_index],
                 name,
-                child_inum
-            );
+                child_inum);
 
             write_result = disk_write_block(
                 dir->direct_blocks[block_index],
-                buffer
-            );
+                buffer);
 
             return write_result;
         }
     }
 
-    
     if (dir->block_count >= 10)
     {
         errno = ENOSPC;
@@ -496,13 +475,11 @@ static int dir_add_entry(uint32_t dir_inum,
     set_dir_entry(
         &entries[0],
         name,
-        child_inum
-    );
+        child_inum);
 
     write_result = disk_write_block(
         (uint64_t)new_block,
-        buffer
-    );
+        buffer);
 
     if (write_result != 0)
     {
@@ -522,7 +499,6 @@ static int dir_add_entry(uint32_t dir_inum,
 
     return 0;
 }
-
 
 static int dir_remove_entry(struct ufs_inode *dir,
                             const char *name)
@@ -548,8 +524,7 @@ static int dir_remove_entry(struct ufs_inode *dir,
 
         read_result = disk_read_block(
             dir->direct_blocks[block_index],
-            buffer
-        );
+            buffer);
 
         if (read_result != 0)
         {
@@ -575,13 +550,11 @@ static int dir_remove_entry(struct ufs_inode *dir,
             memset(
                 &entries[entry_index],
                 0,
-                sizeof(entries[entry_index])
-            );
+                sizeof(entries[entry_index]));
 
             write_result = disk_write_block(
                 dir->direct_blocks[block_index],
-                buffer
-            );
+                buffer);
 
             return write_result;
         }
@@ -590,7 +563,6 @@ static int dir_remove_entry(struct ufs_inode *dir,
     errno = ENOENT;
     return -1;
 }
-
 
 static int dir_is_empty(const struct ufs_inode *dir)
 {
@@ -614,8 +586,7 @@ static int dir_is_empty(const struct ufs_inode *dir)
 
         read_result = disk_read_block(
             dir->direct_blocks[block_index],
-            buffer
-        );
+            buffer);
 
         if (read_result != 0)
         {
@@ -637,8 +608,6 @@ static int dir_is_empty(const struct ufs_inode *dir)
 
     return 1;
 }
-
-
 
 static int resolve_path(const char *path, uint32_t *out_inode)
 {
@@ -698,8 +667,7 @@ static int resolve_path(const char *path, uint32_t *out_inode)
         found = dir_find_entry(
             &current,
             token,
-            &next_inode
-        );
+            &next_inode);
 
         if (found < 0)
         {
@@ -769,7 +737,6 @@ static int resolve_parent(const char *path,
         return -1;
     }
 
-  
     strcpy(name_out, slash + 1);
 
     if (strlen(name_out) == 0 ||
@@ -784,7 +751,7 @@ static int resolve_parent(const char *path,
         *parent_inode = sb.root_inode;
         return 0;
     }
-    
+
     *slash = '\0';
 
     return resolve_path(copy, parent_inode);
@@ -820,9 +787,7 @@ int32_t ufs_get_file_size(int fd)
     return (int32_t)inode.size;
 }
 
-
-//Filesystem API
-
+// Filesystem API
 
 int ufs_format(const char *image_path, size_t image_size)
 {
@@ -839,7 +804,6 @@ int ufs_format(const char *image_path, size_t image_size)
     }
 
     uint64_t total_blocks = image_size / UFS_BLOCK_SIZE;
-
 
     uint8_t zero[UFS_BLOCK_SIZE];
     memset(zero, 0, sizeof(zero));
@@ -896,13 +860,11 @@ int ufs_format(const char *image_path, size_t image_size)
     new_sb.data_blocks = total_blocks - new_sb.data_start;
     new_sb.root_inode = 0;
 
-
     uint8_t sb_block[UFS_BLOCK_SIZE];
     memset(sb_block, 0, sizeof(sb_block));
     memcpy(sb_block, &new_sb, sizeof(new_sb));
     fseeko(f, 0, SEEK_SET);
     fwrite(sb_block, 1, UFS_BLOCK_SIZE, f);
-
 
     size_t ibmp_bytes = (size_t)new_sb.inode_bitmap_blocks * UFS_BLOCK_SIZE;
     uint8_t *ibmp = calloc(1, ibmp_bytes);
@@ -912,7 +874,6 @@ int ufs_format(const char *image_path, size_t image_size)
     fwrite(ibmp, 1, ibmp_bytes, f);
     free(ibmp);
 
-    
     size_t bbmp_bytes = (size_t)new_sb.block_bitmap_blocks * UFS_BLOCK_SIZE;
     uint8_t *bbmp = calloc(1, bbmp_bytes);
     for (uint64_t i = 0; i < new_sb.data_start; i++)
@@ -923,7 +884,6 @@ int ufs_format(const char *image_path, size_t image_size)
     fseeko(f, (off_t)new_sb.block_bitmap_start * UFS_BLOCK_SIZE, SEEK_SET);
     fwrite(bbmp, 1, bbmp_bytes, f);
     free(bbmp);
-
 
     struct ufs_inode root;
     memset(&root, 0, sizeof(root));
@@ -1275,15 +1235,14 @@ int ufs_unlink(const char *path)
     return -1;
 }
 
-
-//4
+// 4
 int ufs_open(const char *path, int flags)
 {
     uint32_t inode_number;
     int fd;
     int result;
 
-    if (disk_fd == -1)
+    if (disk == NULL)
     {
         errno = EINVAL;
         return -1;
@@ -1314,7 +1273,7 @@ int ufs_open(const char *path, int flags)
     return -1;
 }
 
-//4
+// 4
 int ufs_close(int fd)
 {
     if (fd < 0 || fd >= UFS_MAX_OPEN_FILES)
@@ -1334,8 +1293,7 @@ int ufs_close(int fd)
     return 0;
 }
 
-
-//4
+// 4
 off_t ufs_seek(int fd, off_t offset, int whence)
 {
     off_t new_position;
@@ -1389,11 +1347,9 @@ off_t ufs_seek(int fd, off_t offset, int whence)
     return new_position;
 }
 
-
-
 ssize_t ufs_read(int fd, void *buf, size_t count)
 {
-      if (disk == NULL)
+    if (disk == NULL)
     {
         errno = EINVAL;
         return -1;
@@ -1404,7 +1360,6 @@ ssize_t ufs_read(int fd, void *buf, size_t count)
         errno = EBADF;
         return -1;
     }
-
 
     if (!(open_files[fd].flags & UFS_O_RDONLY))
     {
@@ -1432,10 +1387,9 @@ ssize_t ufs_read(int fd, void *buf, size_t count)
 
     off_t offset = open_files[fd].position;
 
-
     if ((uint64_t)offset >= inode.size)
     {
-        return 0; 
+        return 0;
     }
 
     uint64_t available = inode.size - (uint64_t)offset;
@@ -1450,7 +1404,6 @@ ssize_t ufs_read(int fd, void *buf, size_t count)
         uint64_t cur = (uint64_t)offset + bytes_done;
         uint32_t block_index = (uint32_t)(cur / UFS_BLOCK_SIZE);
         uint32_t in_block_off = (uint32_t)(cur % UFS_BLOCK_SIZE);
-
 
         uint32_t disk_block = 0;
         if (block_index < 10)
@@ -1478,7 +1431,7 @@ ssize_t ufs_read(int fd, void *buf, size_t count)
 
         if (disk_block == 0)
         {
-     
+
             memset(block_buf, 0, UFS_BLOCK_SIZE);
         }
         else if (disk_read_block(disk_block, block_buf) != 0)
@@ -1499,7 +1452,6 @@ ssize_t ufs_read(int fd, void *buf, size_t count)
 
     open_files[fd].position += (off_t)bytes_done;
     return (ssize_t)bytes_done;
-
 }
 
 ssize_t ufs_write(int fd, const void *buf, size_t count)
@@ -1571,7 +1523,7 @@ ssize_t ufs_write(int fd, const void *buf, size_t count)
                 int64_t nb = alloc_block();
                 if (nb < 0)
                 {
-                    break; 
+                    break;
                 }
                 inode.direct_blocks[block_index] = (uint32_t)nb;
             }
@@ -1592,7 +1544,7 @@ ssize_t ufs_write(int fd, const void *buf, size_t count)
                 {
                     break;
                 }
-            
+
                 inode.indirect_block = (uint32_t)nb;
             }
             uint32_t ptrs[UFS_BLOCK_SIZE / sizeof(uint32_t)];
@@ -1623,7 +1575,6 @@ ssize_t ufs_write(int fd, const void *buf, size_t count)
             chunk = remaining;
         }
 
-
         if (chunk < UFS_BLOCK_SIZE)
         {
             if (disk_read_block(disk_block, block_buf) != 0)
@@ -1649,7 +1600,6 @@ ssize_t ufs_write(int fd, const void *buf, size_t count)
     }
     inode.modified_at = (int64_t)time(NULL);
 
-
     if (write_inode(inum, &inode) != 0 && bytes_done == 0)
     {
         return -1;
@@ -1664,12 +1614,11 @@ ssize_t ufs_write(int fd, const void *buf, size_t count)
     }
 
     return (ssize_t)bytes_done;
-
 }
 
 int ufs_truncate(const char *path, size_t size)
 {
-     if (disk == NULL)
+    if (disk == NULL)
     {
         errno = EINVAL;
         return -1;
@@ -1696,13 +1645,12 @@ int ufs_truncate(const char *path, size_t size)
     uint64_t new_size = (uint64_t)size;
     const uint32_t ptrs_per_block = UFS_BLOCK_SIZE / sizeof(uint32_t);
 
-
     uint32_t old_blocks = (uint32_t)((inode.size + UFS_BLOCK_SIZE - 1) / UFS_BLOCK_SIZE);
     uint32_t new_blocks = (uint32_t)((new_size + UFS_BLOCK_SIZE - 1) / UFS_BLOCK_SIZE);
 
     if (new_size < inode.size)
     {
-      
+
         for (uint32_t bi = new_blocks; bi < old_blocks; bi++)
         {
             uint32_t disk_block = 0;
@@ -1768,7 +1716,7 @@ int ufs_truncate(const char *path, size_t size)
     }
     else if (new_size > inode.size)
     {
-        
+
         uint32_t old_tail_off = (uint32_t)(inode.size % UFS_BLOCK_SIZE);
         if (inode.size > 0 && old_tail_off != 0)
         {
@@ -1877,7 +1825,6 @@ int ufs_truncate(const char *path, size_t size)
     }
 
     return 0;
-
 }
 
 int ufs_stat(const char *path, struct ufs_stat *st)
@@ -1909,7 +1856,6 @@ int ufs_stat(const char *path, struct ufs_stat *st)
     return 0;
 }
 
- 
 int ufs_fsck(void)
 {
     if (disk == NULL)
