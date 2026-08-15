@@ -1181,28 +1181,525 @@ off_t ufs_seek(int fd, off_t offset, int whence)
 
 ssize_t ufs_read(int fd, void *buf, size_t count)
 {
-    (void)fd;
-    (void)buf;
-    (void)count;
-    errno = ENOSYS;
-    return -1;
+      if (disk == NULL)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    if (fd < 0 || fd >= UFS_MAX_OPEN_FILES || !open_files[fd].used)
+    {
+        errno = EBADF;
+        return -1;
+    }
+
+    /* UFS_O_RDONLY=0x1, UFS_O_WRONLY=0x2, UFS_O_RDWR=0x3.
+     * flags & UFS_O_RDONLY is nonzero for both RDONLY and RDWR. */
+    if (!(open_files[fd].flags & UFS_O_RDONLY))
+    {
+        errno = EBADF;
+        return -1;
+    }
+
+    if (buf == NULL && count > 0)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    struct ufs_inode inode;
+    if (read_inode((uint32_t)open_files[fd].inode_number, &inode) != 0)
+    {
+        return -1;
+    }
+
+    if (inode.type != UFS_TYPE_FILE)
+    {
+        errno = EISDIR;
+        return -1;
+    }
+
+    off_t offset = open_files[fd].position;
+
+    /* EOF guard must come BEFORE the subtraction below: offset can
+     * legitimately exceed inode.size (e.g. after a seek past EOF),
+     * and inode.size - offset would underflow (these are unsigned)
+     * if we didn't check this first. */
+    if ((uint64_t)offset >= inode.size)
+    {
+        return 0; /* EOF, not an error */
+    }
+
+    uint64_t available = inode.size - (uint64_t)offset;
+    size_t to_read = (count < available) ? count : (size_t)available;
+
+    size_t bytes_done = 0;
+    uint8_t block_buf[UFS_BLOCK_SIZE];
+    const uint32_t ptrs_per_block = UFS_BLOCK_SIZE / sizeof(uint32_t);
+
+    while (bytes_done < to_read)
+    {
+        uint64_t cur = (uint64_t)offset + bytes_done;
+        uint32_t block_index = (uint32_t)(cur / UFS_BLOCK_SIZE);
+        uint32_t in_block_off = (uint32_t)(cur % UFS_BLOCK_SIZE);
+
+        /* Resolve block_index -> physical block number:
+         * direct_blocks[0..9] first, then the single
+         * indirect_block for anything beyond that. */
+        uint32_t disk_block = 0;
+        if (block_index < 10)
+        {
+            disk_block = inode.direct_blocks[block_index];
+        }
+        else
+        {
+            uint32_t ind_index = block_index - 10;
+            if (ind_index >= ptrs_per_block)
+            {
+                errno = EFBIG;
+                return -1;
+            }
+            if (inode.indirect_block != 0)
+            {
+                uint32_t ptrs[UFS_BLOCK_SIZE / sizeof(uint32_t)];
+                if (disk_read_block(inode.indirect_block, ptrs) != 0)
+                {
+                    return -1;
+                }
+                disk_block = ptrs[ind_index];
+            }
+        }
+
+        if (disk_block == 0)
+        {
+            /* A hole: this range was never written. Treat as zeros
+             * rather than reading garbage or failing. */
+            memset(block_buf, 0, UFS_BLOCK_SIZE);
+        }
+        else if (disk_read_block(disk_block, block_buf) != 0)
+        {
+            return -1;
+        }
+
+        size_t chunk = UFS_BLOCK_SIZE - in_block_off;
+        size_t remaining = to_read - bytes_done;
+        if (chunk > remaining)
+        {
+            chunk = remaining;
+        }
+
+        memcpy((uint8_t *)buf + bytes_done, block_buf + in_block_off, chunk);
+        bytes_done += chunk;
+    }
+
+    open_files[fd].position += (off_t)bytes_done;
+    return (ssize_t)bytes_done;
+
 }
 
 ssize_t ufs_write(int fd, const void *buf, size_t count)
 {
-    (void)fd;
-    (void)buf;
-    (void)count;
-    errno = ENOSYS;
-    return -1;
+    if (disk == NULL)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    if (fd < 0 || fd >= UFS_MAX_OPEN_FILES || !open_files[fd].used)
+    {
+        errno = EBADF;
+        return -1;
+    }
+
+    /* UFS_O_WRONLY=0x2, UFS_O_RDWR=0x3.
+     * flags & UFS_O_WRONLY is nonzero for both WRONLY and RDWR. */
+    if (!(open_files[fd].flags & UFS_O_WRONLY))
+    {
+        errno = EBADF;
+        return -1;
+    }
+
+    if (buf == NULL && count > 0)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    if (count == 0)
+    {
+        return 0;
+    }
+
+    uint32_t inum = (uint32_t)open_files[fd].inode_number;
+    struct ufs_inode inode;
+    if (read_inode(inum, &inode) != 0)
+    {
+        return -1;
+    }
+
+    if (inode.type != UFS_TYPE_FILE)
+    {
+        errno = EISDIR;
+        return -1;
+    }
+
+    off_t start_offset = open_files[fd].position;
+    if (open_files[fd].flags & UFS_O_APPEND)
+    {
+        /* Always append at the CURRENT end of file, not wherever
+         * the fd's position happens to be. */
+        start_offset = (off_t)inode.size;
+    }
+
+    size_t bytes_done = 0;
+    uint8_t block_buf[UFS_BLOCK_SIZE];
+    const uint32_t ptrs_per_block = UFS_BLOCK_SIZE / sizeof(uint32_t);
+
+    while (bytes_done < count)
+    {
+        uint64_t cur = (uint64_t)start_offset + bytes_done;
+        uint32_t block_index = (uint32_t)(cur / UFS_BLOCK_SIZE);
+        uint32_t in_block_off = (uint32_t)(cur % UFS_BLOCK_SIZE);
+
+        /* Resolve block_index -> physical block number,
+         * allocating on the fly if it doesn't exist yet:
+         * direct_blocks[0..9] first, then the single
+         * indirect_block for anything beyond that. */
+        uint32_t disk_block = 0;
+        if (block_index < 10)
+        {
+            if (inode.direct_blocks[block_index] == 0)
+            {
+                int64_t nb = alloc_block();
+                if (nb < 0)
+                {
+                    break; /* ENOSPC: stop, keep partial progress */
+                }
+                inode.direct_blocks[block_index] = (uint32_t)nb;
+            }
+            disk_block = inode.direct_blocks[block_index];
+        }
+        else
+        {
+            uint32_t ind_index = block_index - 10;
+            if (ind_index >= ptrs_per_block)
+            {
+                errno = EFBIG;
+                break;
+            }
+            if (inode.indirect_block == 0)
+            {
+                int64_t nb = alloc_block();
+                if (nb < 0)
+                {
+                    break;
+                }
+                /* alloc_block() already zero-fills the new block on
+                 * disk, so the pointer table starts all-zero. */
+                inode.indirect_block = (uint32_t)nb;
+            }
+            uint32_t ptrs[UFS_BLOCK_SIZE / sizeof(uint32_t)];
+            if (disk_read_block(inode.indirect_block, ptrs) != 0)
+            {
+                break;
+            }
+            if (ptrs[ind_index] == 0)
+            {
+                int64_t nb = alloc_block();
+                if (nb < 0)
+                {
+                    break;
+                }
+                ptrs[ind_index] = (uint32_t)nb;
+                if (disk_write_block(inode.indirect_block, ptrs) != 0)
+                {
+                    break;
+                }
+            }
+            disk_block = ptrs[ind_index];
+        }
+
+        size_t chunk = UFS_BLOCK_SIZE - in_block_off;
+        size_t remaining = count - bytes_done;
+        if (chunk > remaining)
+        {
+            chunk = remaining;
+        }
+
+        /* Read-modify-write: only needed when NOT overwriting an
+         * entire block, since the disk can't be told to touch just
+         * part of a block. */
+        if (chunk < UFS_BLOCK_SIZE)
+        {
+            if (disk_read_block(disk_block, block_buf) != 0)
+            {
+                break;
+            }
+        }
+
+        memcpy(block_buf + in_block_off, (const uint8_t *)buf + bytes_done, chunk);
+
+        if (disk_write_block(disk_block, block_buf) != 0)
+        {
+            break;
+        }
+
+        bytes_done += chunk;
+    }
+
+    uint64_t new_end = (uint64_t)start_offset + bytes_done;
+    if (new_end > inode.size)
+    {
+        inode.size = new_end;
+    }
+    inode.modified_at = (int64_t)time(NULL);
+
+    /* Persist size + any newly-populated direct_blocks[]/
+     * indirect_block pointers set above. If even this fails and
+     * nothing was written, report failure; if some bytes did make
+     * it to disk, still report that progress. */
+    if (write_inode(inum, &inode) != 0 && bytes_done == 0)
+    {
+        return -1;
+    }
+
+    open_files[fd].position = start_offset + (off_t)bytes_done;
+
+    if (bytes_done == 0 && count > 0)
+    {
+        /* errno was already set by whichever call above failed
+         * (alloc_block -> ENOSPC, indirect range -> EFBIG, or
+         * disk I/O -> EIO). */
+        return -1;
+    }
+
+    return (ssize_t)bytes_done;
+
 }
 
 int ufs_truncate(const char *path, size_t size)
 {
-    (void)path;
-    (void)size;
-    errno = ENOSYS;
-    return -1;
+     if (disk == NULL)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    uint32_t inum;
+    if (resolve_path(path, &inum) != 0)
+    {
+        return -1;
+    }
+
+    struct ufs_inode inode;
+    if (read_inode(inum, &inode) != 0)
+    {
+        return -1;
+    }
+
+    if (inode.type != UFS_TYPE_FILE)
+    {
+        errno = EISDIR;
+        return -1;
+    }
+
+    uint64_t new_size = (uint64_t)size;
+    const uint32_t ptrs_per_block = UFS_BLOCK_SIZE / sizeof(uint32_t);
+
+    /* Number of blocks needed to hold `n` bytes, i.e. ceil(n / UFS_BLOCK_SIZE). */
+    uint32_t old_blocks = (uint32_t)((inode.size + UFS_BLOCK_SIZE - 1) / UFS_BLOCK_SIZE);
+    uint32_t new_blocks = (uint32_t)((new_size + UFS_BLOCK_SIZE - 1) / UFS_BLOCK_SIZE);
+
+    if (new_size < inode.size)
+    {
+        /* SHRINKING: free every block index in [new_blocks, old_blocks)
+         * and clear the inode's pointer to each one. */
+        for (uint32_t bi = new_blocks; bi < old_blocks; bi++)
+        {
+            uint32_t disk_block = 0;
+            if (bi < 10)
+            {
+                disk_block = inode.direct_blocks[bi];
+            }
+            else if (inode.indirect_block != 0)
+            {
+                uint32_t ind_index = bi - 10;
+                uint32_t ptrs[UFS_BLOCK_SIZE / sizeof(uint32_t)];
+                if (disk_read_block(inode.indirect_block, ptrs) != 0)
+                {
+                    return -1;
+                }
+                disk_block = ptrs[ind_index];
+            }
+
+            if (disk_block == 0)
+            {
+                continue;
+            }
+
+            free_block(disk_block);
+
+            if (bi < 10)
+            {
+                inode.direct_blocks[bi] = 0;
+            }
+            else if (inode.indirect_block != 0)
+            {
+                uint32_t ind_index = bi - 10;
+                uint32_t ptrs[UFS_BLOCK_SIZE / sizeof(uint32_t)];
+                if (disk_read_block(inode.indirect_block, ptrs) == 0)
+                {
+                    ptrs[ind_index] = 0;
+                    disk_write_block(inode.indirect_block, ptrs);
+                }
+            }
+        }
+
+        /* If shrinking dropped back to direct-block range entirely
+         * and the indirect block no longer points to anything real,
+         * free the indirect block itself too. */
+        if (inode.indirect_block != 0 && new_blocks <= 10)
+        {
+            uint32_t ptrs[UFS_BLOCK_SIZE / sizeof(uint32_t)];
+            if (disk_read_block(inode.indirect_block, ptrs) == 0)
+            {
+                int any_used = 0;
+                for (uint32_t i = 0; i < ptrs_per_block; i++)
+                {
+                    if (ptrs[i] != 0)
+                    {
+                        any_used = 1;
+                        break;
+                    }
+                }
+                if (!any_used)
+                {
+                    free_block(inode.indirect_block);
+                    inode.indirect_block = 0;
+                }
+            }
+        }
+    }
+    else if (new_size > inode.size)
+    {
+        /* GROWING.
+         *
+         * First: if the OLD size didn't end exactly on a block
+         * boundary, the tail of that last block may hold stale
+         * bytes left over from an earlier, larger write that was
+         * since shrunk. Zero that tail explicitly so a later read
+         * of the newly-grown region returns zeros, not leftovers. */
+        uint32_t old_tail_off = (uint32_t)(inode.size % UFS_BLOCK_SIZE);
+        if (inode.size > 0 && old_tail_off != 0)
+        {
+            uint32_t old_last_index = (uint32_t)((inode.size - 1) / UFS_BLOCK_SIZE);
+
+            uint32_t disk_block = 0;
+            if (old_last_index < 10)
+            {
+                disk_block = inode.direct_blocks[old_last_index];
+            }
+            else if (inode.indirect_block != 0)
+            {
+                uint32_t ind_index = old_last_index - 10;
+                uint32_t ptrs[UFS_BLOCK_SIZE / sizeof(uint32_t)];
+                if (disk_read_block(inode.indirect_block, ptrs) != 0)
+                {
+                    return -1;
+                }
+                disk_block = ptrs[ind_index];
+            }
+
+            if (disk_block != 0)
+            {
+                uint8_t block_buf[UFS_BLOCK_SIZE];
+                if (disk_read_block(disk_block, block_buf) != 0)
+                {
+                    return -1;
+                }
+                memset(block_buf + old_tail_off, 0, UFS_BLOCK_SIZE - old_tail_off);
+                if (disk_write_block(disk_block, block_buf) != 0)
+                {
+                    return -1;
+                }
+            }
+        }
+
+        /* Then: allocate and zero-fill every wholly-new block
+         * needed to reach the new size. */
+        uint8_t zeros[UFS_BLOCK_SIZE];
+        memset(zeros, 0, sizeof(zeros));
+
+        for (uint32_t bi = old_blocks; bi < new_blocks; bi++)
+        {
+            uint32_t disk_block = 0;
+            if (bi < 10)
+            {
+                if (inode.direct_blocks[bi] == 0)
+                {
+                    int64_t nb = alloc_block();
+                    if (nb < 0)
+                    {
+                        return -1;
+                    }
+                    inode.direct_blocks[bi] = (uint32_t)nb;
+                }
+                disk_block = inode.direct_blocks[bi];
+            }
+            else
+            {
+                uint32_t ind_index = bi - 10;
+                if (ind_index >= ptrs_per_block)
+                {
+                    errno = EFBIG;
+                    return -1;
+                }
+                if (inode.indirect_block == 0)
+                {
+                    int64_t nb = alloc_block();
+                    if (nb < 0)
+                    {
+                        return -1;
+                    }
+                    inode.indirect_block = (uint32_t)nb;
+                }
+                uint32_t ptrs[UFS_BLOCK_SIZE / sizeof(uint32_t)];
+                if (disk_read_block(inode.indirect_block, ptrs) != 0)
+                {
+                    return -1;
+                }
+                if (ptrs[ind_index] == 0)
+                {
+                    int64_t nb = alloc_block();
+                    if (nb < 0)
+                    {
+                        return -1;
+                    }
+                    ptrs[ind_index] = (uint32_t)nb;
+                    if (disk_write_block(inode.indirect_block, ptrs) != 0)
+                    {
+                        return -1;
+                    }
+                }
+                disk_block = ptrs[ind_index];
+            }
+
+            if (disk_write_block(disk_block, zeros) != 0)
+            {
+                return -1;
+            }
+        }
+    }
+
+    inode.size = new_size;
+    inode.modified_at = (int64_t)time(NULL);
+    if (write_inode(inum, &inode) != 0)
+    {
+        return -1;
+    }
+
+    return 0;
+
 }
 
 int ufs_stat(const char *path, struct ufs_stat *st)
