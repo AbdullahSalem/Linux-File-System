@@ -2,6 +2,7 @@
 #define USERFS_H
 
 #include <stddef.h>
+#include <stdint.h>
 #include <sys/types.h>
 
 #ifdef __cplusplus
@@ -52,6 +53,8 @@ extern "C"
     off_t ufs_seek(int fd, off_t offset, int whence);
     int ufs_truncate(const char *path, size_t size);
     int ufs_stat(const char *path, struct ufs_stat *st);
+    int ufs_find_by_tag(const char *tag, uint32_t *matching_inums, size_t max_results);
+    int ufs_set_tag(const char *path, const char *tag);
     
     int ufs_fsck(void);
 

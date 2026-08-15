@@ -12,6 +12,27 @@
 #include <fcntl.h>
 #include <stdint.h>
 
+#ifndef EUCLEAN
+#define EUCLEAN 117
+#endif
+
+static uint32_t crc32_block(const uint8_t *data, size_t len)
+{
+    uint32_t crc = 0xFFFFFFFFu;
+
+    for (size_t i = 0; i < len; i++)
+    {
+        crc ^= data[i];
+        for (int b = 0; b < 8; b++)
+        {
+            uint32_t mask = -(crc & 1u);
+            crc = (crc >> 1) ^ (0xEDB88320u & mask);
+        }
+    }
+
+    return ~crc;
+}
+
 static FILE *disk = NULL;
 static struct ufs_superblock sb;
 static struct ufs_open_file open_files[UFS_MAX_OPEN_FILES];
@@ -1688,6 +1709,16 @@ ssize_t ufs_read(int fd, void *buf, size_t count)
         {
             return -1;
         }
+        else if (block_index < 10 && inode.block_checksums[block_index] != 0)
+        {
+            uint32_t computed = crc32_block(block_buf, UFS_BLOCK_SIZE);
+
+            if (computed != inode.block_checksums[block_index])
+            {
+                errno = EUCLEAN;
+                return -1;
+            }
+        }
 
         size_t chunk = UFS_BLOCK_SIZE - in_block_off;
         size_t remaining = to_read - bytes_done;
@@ -1795,6 +1826,8 @@ ssize_t ufs_write(int fd, const void *buf, size_t count)
             return -1;
         }
 
+        inode.block_checksums[0] = crc32_block(evict_block, UFS_BLOCK_SIZE);
+
         memset(inode.direct_blocks, 0, sizeof(inode.direct_blocks));
         inode.direct_blocks[0] = (uint32_t)nb;
         inode.flags &= ~UFS_INODE_FLAG_INLINE_DATA;
@@ -1880,6 +1913,11 @@ ssize_t ufs_write(int fd, const void *buf, size_t count)
 
         memcpy(block_buf + in_block_off, (const uint8_t *)buf + bytes_done, chunk);
 
+        if (block_index < 10)
+        {
+            inode.block_checksums[block_index] = crc32_block(block_buf, UFS_BLOCK_SIZE);
+        }
+
         if (disk_write_block(disk_block, block_buf) != 0)
         {
             break;
@@ -1942,6 +1980,53 @@ int ufs_truncate(const char *path, size_t size)
     }
 
     uint64_t new_size = (uint64_t)size;
+
+    if (inode.flags & UFS_INODE_FLAG_INLINE_DATA)
+    {
+        if (new_size <= UFS_INLINE_DATA_MAX_SIZE)
+        {
+            if (new_size > inode.size)
+            {
+                memset((uint8_t *)inode.direct_blocks + inode.size, 0, new_size - inode.size);
+            }
+            else
+            {
+                memset((uint8_t *)inode.direct_blocks + new_size, 0, UFS_INLINE_DATA_MAX_SIZE - new_size);
+            }
+
+            inode.size = new_size;
+            inode.modified_at = (int64_t)time(NULL);
+
+            if (write_inode(inum, &inode) != 0)
+            {
+                return -1;
+            }
+
+            return 0;
+        }
+
+        uint8_t evict_block[UFS_BLOCK_SIZE];
+        memset(evict_block, 0, sizeof(evict_block));
+        memcpy(evict_block, inode.direct_blocks, UFS_INLINE_DATA_MAX_SIZE);
+
+        int64_t nb = alloc_block();
+        if (nb < 0)
+        {
+            return -1;
+        }
+
+        if (disk_write_block((uint64_t)nb, evict_block) != 0)
+        {
+            free_block((uint64_t)nb);
+            return -1;
+        }
+
+        memset(inode.direct_blocks, 0, sizeof(inode.direct_blocks));
+        inode.direct_blocks[0] = (uint32_t)nb;
+        inode.block_checksums[0] = crc32_block(evict_block, UFS_BLOCK_SIZE);
+        inode.flags &= ~UFS_INODE_FLAG_INLINE_DATA;
+    }
+
     const uint32_t ptrs_per_block = UFS_BLOCK_SIZE / sizeof(uint32_t);
 
     uint32_t old_blocks = (uint32_t)((inode.size + UFS_BLOCK_SIZE - 1) / UFS_BLOCK_SIZE);
@@ -1949,7 +2034,6 @@ int ufs_truncate(const char *path, size_t size)
 
     if (new_size < inode.size)
     {
-
         for (uint32_t bi = new_blocks; bi < old_blocks; bi++)
         {
             uint32_t disk_block = 0;
@@ -1978,6 +2062,7 @@ int ufs_truncate(const char *path, size_t size)
             if (bi < 10)
             {
                 inode.direct_blocks[bi] = 0;
+                inode.block_checksums[bi] = 0;
             }
             else if (inode.indirect_block != 0)
             {
@@ -2015,7 +2100,6 @@ int ufs_truncate(const char *path, size_t size)
     }
     else if (new_size > inode.size)
     {
-
         uint32_t old_tail_off = (uint32_t)(inode.size % UFS_BLOCK_SIZE);
         if (inode.size > 0 && old_tail_off != 0)
         {
@@ -2048,6 +2132,10 @@ int ufs_truncate(const char *path, size_t size)
                 if (disk_write_block(disk_block, block_buf) != 0)
                 {
                     return -1;
+                }
+                if (old_last_index < 10)
+                {
+                    inode.block_checksums[old_last_index] = crc32_block(block_buf, UFS_BLOCK_SIZE);
                 }
             }
         }
@@ -2113,6 +2201,11 @@ int ufs_truncate(const char *path, size_t size)
             {
                 return -1;
             }
+
+            if (bi < 10)
+            {
+                inode.block_checksums[bi] = crc32_block(zeros, UFS_BLOCK_SIZE);
+            }
         }
     }
 
@@ -2124,6 +2217,78 @@ int ufs_truncate(const char *path, size_t size)
     }
 
     return 0;
+}
+
+int ufs_find_by_tag(const char *tag, uint32_t *matching_inums, size_t max_results)
+{
+    if (disk == NULL || tag == NULL)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    size_t found = 0;
+
+    for (uint32_t i = 0; i < sb.total_inodes; i++)
+    {
+        struct ufs_inode ino;
+        if (read_inode(i, &ino) != 0)
+        {
+            continue;
+        }
+
+        if (ino.used != 1)
+        {
+            continue;
+        }
+
+        char tag_buf[sizeof(ino.tags) + 1];
+        memcpy(tag_buf, ino.tags, sizeof(ino.tags));
+        tag_buf[sizeof(ino.tags)] = '\0';
+
+        if (strcmp(tag_buf, tag) == 0)
+        {
+            if (found < max_results)
+            {
+                matching_inums[found] = i;
+            }
+            found++;
+        }
+    }
+
+    return (int)found;
+}
+
+int ufs_set_tag(const char *path, const char *tag)
+{
+    if (disk == NULL || tag == NULL)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    uint32_t inum;
+    if (resolve_path(path, &inum) != 0)
+    {
+        return -1;
+    }
+
+    struct ufs_inode inode;
+    if (read_inode(inum, &inode) != 0)
+    {
+        return -1;
+    }
+
+    if (strlen(tag) > sizeof(inode.tags))
+    {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    memset(inode.tags, 0, sizeof(inode.tags));
+    memcpy(inode.tags, tag, strlen(tag));
+
+    return write_inode(inum, &inode);
 }
 
 int ufs_stat(const char *path, struct ufs_stat *st)
