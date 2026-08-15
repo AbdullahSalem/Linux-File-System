@@ -1542,6 +1542,18 @@ int ufs_open(const char *path, int flags)
         return -1;
     }
 
+    struct ufs_inode inode;
+    if (read_inode(inode_number, &inode) != 0)
+    {
+        return -1;
+    }
+
+    if ((flags & (O_WRONLY | O_RDWR)) && !(inode.permissions & 0200))
+    {
+        errno = EACCES;
+        return -1;
+    }
+
     for (fd = 0; fd < UFS_MAX_OPEN_FILES; fd++)
     {
         if (!open_files[fd].used)
@@ -1884,7 +1896,6 @@ ssize_t ufs_write(int fd, const void *buf, size_t count)
     {
         inode.size = new_end;
     }
-    inode.modified_at = (int64_t)time(NULL);
 
     if (write_inode(inum, &inode) != 0 && bytes_done == 0)
     {
@@ -1892,6 +1903,11 @@ ssize_t ufs_write(int fd, const void *buf, size_t count)
     }
 
     open_files[fd].position = start_offset + (off_t)bytes_done;
+
+    if (bytes_done > 0)
+    {
+        inode.modified_at = (int64_t)time(NULL);
+    }
 
     if (bytes_done == 0 && count > 0)
     {
