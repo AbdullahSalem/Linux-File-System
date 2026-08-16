@@ -1925,32 +1925,36 @@ ssize_t ufs_write(int fd, const void *buf, size_t count)
 
         bytes_done += chunk;
     }
-
+    
+    
+    
+    
     uint64_t new_end = (uint64_t)start_offset + bytes_done;
-    if (new_end > inode.size)
-    {
-        inode.size = new_end;
-    }
 
-    if (write_inode(inum, &inode) != 0 && bytes_done == 0)
-    {
-        return -1;
-    }
+	if (new_end > inode.size)
+	{
+	    inode.size = new_end;
+	}
+	
+	if (bytes_done > 0)
+	{
+	    inode.modified_at = (int64_t)time(NULL);
+	}
 
-    open_files[fd].position = start_offset + (off_t)bytes_done;
+	if (write_inode(inum, &inode) != 0)
+	{
+    	return -1;
+	}
 
-    if (bytes_done > 0)
-    {
-        inode.modified_at = (int64_t)time(NULL);
-    }
+	open_files[fd].position =
+        start_offset + (off_t)bytes_done;
 
-    if (bytes_done == 0 && count > 0)
-    {
+	if (bytes_done == 0 && count > 0)
+	{
+  	  return -1;
+	}
 
-        return -1;
-    }
-
-    return (ssize_t)bytes_done;
+	return (ssize_t)bytes_done;
 }
 
 int ufs_truncate(const char *path, size_t size)
@@ -2279,7 +2283,7 @@ int ufs_set_tag(const char *path, const char *tag)
         return -1;
     }
 
-    if (strlen(tag) > sizeof(inode.tags))
+    if (strlen(tag) >= sizeof(inode.tags))
     {
         errno = ENAMETOOLONG;
         return -1;

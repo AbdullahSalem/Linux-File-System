@@ -7,6 +7,7 @@
 
 #define INPUT_SIZE 1024
 #define READ_BUFFER_SIZE 4096
+#define MAX_TAG_RESULTS 128
 
 
 static void print_error(void)
@@ -42,6 +43,12 @@ static void print_help(void)
 
     printf("  truncate <path> <size>\n");
     printf("  stat <path>\n");
+    printf("\n");
+
+    printf("  settag <path> <tag>\n");
+    printf("  findtag <tag>\n");
+    printf("\n");
+
     printf("  fsck\n");
     printf("  help\n");
     printf("  exit\n");
@@ -456,14 +463,9 @@ static void command_write(const char *input)
      * input:
      *
      * write <fd> <text>
-     *
-     * Skip "write".
      */
     data = input + 5;
 
-    /*
-     * Skip spaces after "write".
-     */
     while (*data == ' ' || *data == '\t')
         data++;
 
@@ -473,9 +475,6 @@ static void command_write(const char *input)
         return;
     }
 
-    /*
-     * Parse the file descriptor.
-     */
     fd = strtol(
         data,
         &end,
@@ -488,9 +487,6 @@ static void command_write(const char *input)
         return;
     }
 
-    /*
-     * There must be whitespace after the fd.
-     */
     if (*end != ' ' && *end != '\t')
     {
         printf("Usage: write <fd> <text>\n");
@@ -499,9 +495,6 @@ static void command_write(const char *input)
 
     data = end;
 
-    /*
-     * Skip spaces between fd and data.
-     */
     while (*data == ' ' || *data == '\t')
         data++;
 
@@ -661,6 +654,81 @@ static void command_stat(char **args, int argc)
 }
 
 
+/*
+ * Set a tag on a file.
+ *
+ * Shell command:
+ *
+ *     settag <path> <tag>
+ */
+static void command_settag(char **args, int argc)
+{
+    int result;
+
+    if (argc != 3)
+    {
+        printf("Usage: settag <path> <tag>\n");
+        return;
+    }
+
+    result = ufs_set_tag(
+        args[1],
+        args[2]
+    );
+
+    if (result == 0)
+        printf("Tag set successfully.\n");
+    else
+        print_error();
+}
+
+
+/*
+ * Find files/directories associated with a tag.
+ *
+ * Shell command:
+ *
+ *     findtag <tag>
+ */
+static void command_findtag(char **args, int argc)
+{
+    uint32_t matching_inums[MAX_TAG_RESULTS];
+    int count;
+
+    if (argc != 2)
+    {
+        printf("Usage: findtag <tag>\n");
+        return;
+    }
+
+    count = ufs_find_by_tag(
+        args[1],
+        matching_inums,
+        MAX_TAG_RESULTS
+    );
+
+    if (count < 0)
+    {
+        print_error();
+        return;
+    }
+
+    printf("Matching inodes: %d\n", count);
+
+    if (count == 0)
+    {
+        printf("No matching entries found.\n");
+        return;
+    }
+
+    for (int i = 0; i < count; i++)
+    {
+        printf("  inode: %u\n",
+               matching_inums[i]);
+    }
+}
+
+
 static void command_fsck(int argc)
 {
     int result;
@@ -802,6 +870,14 @@ int main(void)
         else if (strcmp(args[0], "stat") == 0)
         {
             command_stat(args, argc);
+        }
+        else if (strcmp(args[0], "settag") == 0)
+        {
+            command_settag(args, argc);
+        }
+        else if (strcmp(args[0], "findtag") == 0)
+        {
+            command_findtag(args, argc);
         }
         else if (strcmp(args[0], "fsck") == 0)
         {

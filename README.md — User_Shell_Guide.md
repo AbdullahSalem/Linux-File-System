@@ -16,11 +16,13 @@ The shell provides commands for:
 - Moving the file position with `seek`
 - Changing file size with `truncate`
 - Viewing file metadata with `stat`
+- Assigning tags to files with `settag`
+- Finding files by tag with `findtag`
 - Checking filesystem consistency with `fsck`
 
 ---
 
-## 1. Building
+# 1. Building
 
 From the project directory, compile the filesystem and shell together:
 
@@ -47,7 +49,7 @@ ufs>
 
 ---
 
-## 2. Getting Help
+# 2. Getting Help
 
 Inside the shell:
 
@@ -55,11 +57,11 @@ Inside the shell:
 ufs> help
 ```
 
-This displays all available commands and their syntax.
+This displays all available commands, their syntax, supported open flags, and seek positions.
 
 ---
 
-## 3. Basic Workflow
+# 3. Basic Workflow
 
 A normal filesystem session follows this order:
 
@@ -69,6 +71,8 @@ Format
 Mount
   ↓
 Create/use files and directories
+  ↓
+Set/search file tags
   ↓
 Check filesystem
   ↓
@@ -186,6 +190,8 @@ or:
 ufs> listdir /docs
 ```
 
+The command displays the entries contained in the directory, including their type, name, and size.
+
 ---
 
 ## Remove a Directory
@@ -246,7 +252,18 @@ Example:
 ufs> stat /docs/test.txt
 ```
 
-This displays information such as the file type and size.
+This displays information such as:
+
+```text
+Type: FILE
+Size: 12 bytes
+```
+
+For directories, the type is displayed as:
+
+```text
+Type: DIRECTORY
+```
 
 ---
 
@@ -307,7 +324,13 @@ Text containing spaces is supported:
 ufs> write 0 Hello this is my filesystem
 ```
 
-The shell reports the number of bytes written.
+The shell reports the number of bytes written:
+
+```text
+Bytes written: 12
+```
+
+The file must be opened with a write-capable flag such as `wronly`, `rdwr`, or an appropriate append mode.
 
 ---
 
@@ -323,7 +346,14 @@ Example:
 ufs> read 0 20
 ```
 
-The shell displays the number of bytes returned and the data.
+The shell displays the number of bytes returned and the data:
+
+```text
+Bytes read: 12
+Data: Hello UserFS
+```
+
+The file descriptor must have been opened with a read-capable mode.
 
 ---
 
@@ -349,7 +379,7 @@ Move to the beginning:
 ufs> seek 0 0 set
 ```
 
-Move five bytes forward:
+Move five bytes forward from the current position:
 
 ```text
 ufs> seek 0 5 cur
@@ -359,6 +389,12 @@ Move two bytes before the end:
 
 ```text
 ufs> seek 0 -2 end
+```
+
+A successful operation reports the new file position:
+
+```text
+New position: 5
 ```
 
 ---
@@ -376,6 +412,8 @@ ufs> close 0
 ```
 
 Use the file descriptor returned by `open`.
+
+Closing a file descriptor releases the corresponding open-file resource.
 
 ---
 
@@ -397,9 +435,65 @@ Verify the new size with:
 ufs> stat /docs/test.txt
 ```
 
+For example:
+
+```text
+Size: 5 bytes
+```
+
 ---
 
-# 13. Checking the Filesystem
+# 13. File Tags
+
+UserFS supports assigning a tag to a file and searching for files associated with a tag.
+
+Tags can be used to organize or classify files without changing their filenames or directory locations.
+
+## Set a Tag
+
+```text
+settag <path> <tag>
+```
+
+Example:
+
+```text
+ufs> settag /docs/test.txt important
+```
+
+This associates the specified tag with the file.
+
+The path must identify an existing file.
+
+---
+
+## Find Files by Tag
+
+```text
+findtag <tag>
+```
+
+Example:
+
+```text
+ufs> findtag important
+```
+
+This searches the filesystem for files associated with the specified tag.
+
+The underlying UserFS API returns the inode numbers of matching files. Therefore, the shell reports the matching inode numbers rather than assuming that the API directly returns file paths.
+
+For example, a result may be displayed in the form:
+
+```text
+Matching inodes: 1 5 8
+```
+
+The exact output depends on the implementation of the shell command.
+
+---
+
+# 14. Checking the Filesystem
 
 Run:
 
@@ -409,11 +503,17 @@ ufs> fsck
 
 This checks the filesystem consistency.
 
-It is particularly useful after creating, deleting, or modifying files.
+It is particularly useful after creating, deleting, tagging, or modifying files.
+
+A successful check reports:
+
+```text
+fsck completed successfully.
+```
 
 ---
 
-# 14. Ending a Session
+# 15. Ending a Session
 
 A recommended ending sequence is:
 
@@ -431,14 +531,22 @@ ufs> quit
 
 ---
 
-# 15. Complete Example
+# 16. Complete Example
+
+The following example demonstrates formatting, mounting, directory and file creation, writing, reading, tagging, seeking, metadata inspection, filesystem checking, and unmounting.
 
 ```text
 ufs> format filesystem.img 1048576
+Filesystem formatted successfully.
+
 ufs> mount filesystem.img
+Filesystem mounted successfully.
 
 ufs> mkdir /docs
+Directory created.
+
 ufs> create /docs/test.txt
+File created.
 
 ufs> open /docs/test.txt wronly
 File descriptor: 0
@@ -447,6 +555,7 @@ ufs> write 0 Hello UserFS
 Bytes written: 12
 
 ufs> close 0
+File descriptor closed.
 
 ufs> open /docs/test.txt rdonly
 File descriptor: 0
@@ -459,12 +568,78 @@ Bytes read: 12
 Data: Hello UserFS
 
 ufs> close 0
+File descriptor closed.
 
 ufs> stat /docs/test.txt
+Type: FILE
+Size: 12 bytes
+
+ufs> settag /docs/test.txt important
+
+ufs> findtag important
+
 ufs> listdir /docs
 
 ufs> fsck
+fsck completed successfully.
+
 ufs> unmount
+Filesystem unmounted successfully.
+
 ufs> exit
 ```
 
+---
+
+# 17. Command Reference
+
+| Command | Syntax | Purpose |
+|---|---|---|
+| `format` | `format <image> <size>` | Create a new filesystem image |
+| `mount` | `mount <image>` | Mount a filesystem image |
+| `unmount` | `unmount` | Unmount the filesystem |
+| `mkdir` | `mkdir <path>` | Create a directory |
+| `rmdir` | `rmdir <path>` | Remove a directory |
+| `listdir` | `listdir <path>` | List directory contents |
+| `create` | `create <path>` | Create a file |
+| `unlink` | `unlink <path>` | Remove a file |
+| `open` | `open <path> <flags>` | Open a file |
+| `close` | `close <fd>` | Close an open file |
+| `read` | `read <fd> <count>` | Read file data |
+| `write` | `write <fd> <text>` | Write data to a file |
+| `seek` | `seek <fd> <offset> <whence>` | Change file position |
+| `truncate` | `truncate <path> <size>` | Change file size |
+| `stat` | `stat <path>` | Display file metadata |
+| `settag` | `settag <path> <tag>` | Assign a tag to a file |
+| `findtag` | `findtag <tag>` | Find files associated with a tag |
+| `fsck` | `fsck` | Check filesystem consistency |
+| `help` | `help` | Display command help |
+| `exit` | `exit` | Exit the shell |
+| `quit` | `quit` | Exit the shell |
+
+---
+
+# 18. Open Flags Reference
+
+| Flag | Purpose |
+|---|---|
+| `rdonly` | Open for reading |
+| `wronly` | Open for writing |
+| `rdwr` | Open for reading and writing |
+| `append` | Open with append behavior |
+
+---
+
+# 19. Seek Positions Reference
+
+| Position | Meaning |
+|---|---|
+| `set` | Position relative to the beginning of the file |
+| `cur` | Position relative to the current file position |
+| `end` | Position relative to the end of the file |
+
+---
+
+## Summary
+
+`ufs_shell` provides a command-line interface over the UserFS API, allowing filesystem operations to be tested interactively. The shell supports filesystem management, directories, files, file descriptors, data I/O, file positioning, file resizing, metadata inspection, file tagging, tag-based searching, and filesystem consistency checking.

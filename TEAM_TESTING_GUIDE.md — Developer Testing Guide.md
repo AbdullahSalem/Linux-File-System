@@ -41,6 +41,10 @@ Directories
     ↓
 Files
     ↓
+File Metadata
+    ↓
+File Tags
+    ↓
 Open File Descriptors
     ↓
 Read / Write
@@ -188,7 +192,171 @@ This should fail.
 
 ---
 
-# 7. Level 5 — Open and Close
+# 7. Level 5 — File Metadata
+
+The `stat` API should be tested independently from file contents.
+
+Run:
+
+```text
+ufs> stat /docs/course/test.txt
+```
+
+Verify:
+
+- The type is reported as `FILE`.
+- The initial size is zero.
+- The operation succeeds for an existing file.
+
+Also test a directory:
+
+```text
+ufs> stat /docs
+```
+
+The type should be reported as `DIRECTORY`.
+
+Test a nonexistent path:
+
+```text
+ufs> stat /missing
+```
+
+The operation should fail with an appropriate error.
+
+---
+
+# 8. Level 6 — File Tags
+
+UserFS supports assigning a tag to a file and finding files by tag.
+
+The two relevant APIs are:
+
+```c
+int ufs_set_tag(const char *path, const char *tag);
+
+int ufs_find_by_tag(
+    const char *tag,
+    uint32_t *matching_inums,
+    size_t max_results
+);
+```
+
+The shell should expose these operations through commands for setting a tag and searching for matching files.
+
+## Set a Tag
+
+Create a few files:
+
+```text
+ufs> create /docs/file1.txt
+ufs> create /docs/file2.txt
+ufs> create /docs/file3.txt
+```
+
+Assign the same tag to two files:
+
+```text
+ufs> settag /docs/file1.txt project
+ufs> settag /docs/file2.txt project
+```
+
+Assign a different tag to the third file:
+
+```text
+ufs> settag /docs/file3.txt test
+```
+
+## Find Files by Tag
+
+Search for the `project` tag:
+
+```text
+ufs> findtag project
+```
+
+The result should contain the files associated with that tag.
+
+For example, the result should identify the inodes corresponding to:
+
+```text
+/docs/file1.txt
+/docs/file2.txt
+```
+
+The file with the `test` tag should not appear in the `project` results.
+
+## Test a Tag With No Matches
+
+```text
+ufs> findtag nonexistent
+```
+
+This should return no matching files rather than reporting unrelated files.
+
+## Change an Existing Tag
+
+Change the tag of a file:
+
+```text
+ufs> settag /docs/file1.txt test
+```
+
+Then:
+
+```text
+ufs> findtag project
+```
+
+`file1.txt` should no longer be associated with `project`.
+
+Search again:
+
+```text
+ufs> findtag test
+```
+
+The result should now include `file1.txt` and `file3.txt`.
+
+## Tag Error Cases
+
+Test tagging a nonexistent file:
+
+```text
+ufs> settag /missing.txt project
+```
+
+This should fail appropriately.
+
+Test searching with an invalid or empty tag according to the API's validation rules.
+
+## Tag Persistence
+
+After assigning tags:
+
+```text
+ufs> fsck
+ufs> unmount
+```
+
+Remount the same image:
+
+```text
+ufs> mount filesystem.img
+```
+
+Then search again:
+
+```text
+ufs> findtag project
+ufs> findtag test
+```
+
+Tags should remain associated with the correct files after remounting if tag information is stored persistently by the implementation.
+
+---
+
+# 9. Level 7 — Open and Close
 
 Open the file:
 
@@ -220,7 +388,7 @@ The operation should fail with an appropriate error.
 
 ---
 
-# 8. Level 6 — Write
+# 10. Level 8 — Write
 
 Open:
 
@@ -254,7 +422,7 @@ Then verify the resulting file contents.
 
 ---
 
-# 9. Level 7 — Read
+# 11. Level 9 — Read
 
 Close the write descriptor:
 
@@ -284,11 +452,11 @@ Verify that the returned data matches what was written.
 
 ---
 
-# 10. Level 8 — Seek
+# 12. Level 10 — Seek
 
 Test all three `whence` modes.
 
-## SEEK\_SET
+## SEEK_SET
 
 ```text
 ufs> seek 0 0 set
@@ -300,7 +468,7 @@ Expected position:
 0
 ```
 
-## SEEK\_CUR
+## SEEK_CUR
 
 ```text
 ufs> seek 0 5 set
@@ -313,7 +481,7 @@ Expected position:
 8
 ```
 
-## SEEK\_END
+## SEEK_END
 
 For a file of known size:
 
@@ -333,7 +501,7 @@ The position should be two bytes before the end.
 
 ---
 
-# 11. Level 9 — Truncate
+# 13. Level 11 — Truncate
 
 First determine the current size:
 
@@ -359,7 +527,7 @@ If the implementation supports extending files through `truncate`, test that sep
 
 ---
 
-# 12. Level 10 — File Deletion
+# 14. Level 12 — File Deletion
 
 Close any open descriptor:
 
@@ -387,9 +555,17 @@ ufs> stat /docs/course/test.txt
 
 The file should no longer be resolvable.
 
+If the file had a tag, also test the tag index after deletion:
+
+```text
+ufs> findtag project
+```
+
+The deleted file should not continue to appear as a valid matching file.
+
 ---
 
-# 13. Level 11 — Directory Deletion
+# 15. Level 13 — Directory Deletion
 
 After deleting the file:
 
@@ -413,7 +589,7 @@ The root should no longer contain `/docs`.
 
 ---
 
-# 14. Level 12 — Filesystem Consistency
+# 16. Level 14 — Filesystem Consistency
 
 Run:
 
@@ -431,11 +607,13 @@ unlink
 rmdir
 ```
 
+Also run it after tag-related metadata changes if tags are stored in filesystem metadata.
+
 A failure here should be investigated before continuing.
 
 ---
 
-# 15. Level 13 — Persistence
+# 17. Level 15 — Persistence
 
 Create a file:
 
@@ -446,10 +624,17 @@ ufs> write 0 Persistent data
 ufs> close 0
 ```
 
+Assign a tag:
+
+```text
+ufs> settag /persistent.txt persistent
+```
+
 Verify:
 
 ```text
 ufs> stat /persistent.txt
+ufs> findtag persistent
 ```
 
 Run:
@@ -482,15 +667,20 @@ Verify:
 ufs> stat /persistent.txt
 ufs> open /persistent.txt rdonly
 ufs> read 0 20
+ufs> close 0
 ```
 
-The data must still be present.
+Verify the tag:
 
-This test verifies that filesystem state was correctly persisted to the disk image.
+```text
+ufs> findtag persistent
+```
+
+The file data, metadata, and tag information should still be present after remounting if these structures are persistent.
 
 ---
 
-# 16. Error Testing
+# 18. Error Testing
 
 The API should reject invalid operations appropriately.
 
@@ -533,13 +723,22 @@ ufs> seek 99 0 set
 
 ```text
 ufs> stat /does/not/exist
+ufs> settag /does/not/exist test
 ```
+
+## Tag Search
+
+```text
+ufs> findtag nonexistent
+```
+
+The command should return no matching files.
 
 Record both the shell output and `errno`.
 
 ---
 
-# 17. Allocation and Deallocation Testing
+# 19. Allocation and Deallocation Testing
 
 After basic functionality works, test block allocation.
 
@@ -573,7 +772,7 @@ The purpose is to verify that blocks are correctly allocated and released.
 
 ---
 
-# 18. Direct and Indirect Block Testing
+# 20. Direct and Indirect Block Testing
 
 Large files should be specifically tested to cross the boundary between direct and indirect addressing.
 
@@ -590,7 +789,53 @@ Do not consider large-file support verified merely because a small file can be r
 
 ---
 
-# 19. Recommended Regression Test
+# 21. Tagging Regression Test
+
+A complete tag regression test should be run after changes to inode, directory, allocation, or metadata code.
+
+Example:
+
+```text
+ufs> format filesystem.img 1048576
+ufs> mount filesystem.img
+
+ufs> mkdir /projects
+ufs> create /projects/a.txt
+ufs> create /projects/b.txt
+ufs> create /projects/c.txt
+
+ufs> settag /projects/a.txt important
+ufs> settag /projects/b.txt important
+ufs> settag /projects/c.txt temporary
+
+ufs> findtag important
+ufs> findtag temporary
+
+ufs> settag /projects/a.txt temporary
+
+ufs> findtag important
+ufs> findtag temporary
+
+ufs> fsck
+ufs> unmount
+ufs> mount filesystem.img
+
+ufs> findtag important
+ufs> findtag temporary
+```
+
+Verify that:
+
+- `a.txt` and `b.txt` initially match `important`.
+- `c.txt` initially matches `temporary`.
+- After changing `a.txt`, it no longer matches `important`.
+- `a.txt` and `c.txt` match `temporary`.
+- The results remain correct after unmounting and remounting.
+- `fsck` remains successful.
+
+---
+
+# 22. Recommended Regression Test
 
 After modifying filesystem code, run at least:
 
@@ -601,6 +846,9 @@ stat /
 listdir /
 mkdir
 create
+stat
+settag
+findtag
 open
 write
 seek
@@ -609,19 +857,21 @@ stat
 truncate
 close
 unlink
+findtag
 rmdir
 fsck
 unmount
 mount
 stat
+findtag
 fsck
 ```
 
-This provides a basic regression check for the complete API.
+This provides a basic regression check for the complete API, including the tag functionality.
 
 ---
 
-# 20. Debugging Procedure
+# 23. Debugging Procedure
 
 When an operation fails:
 
@@ -641,6 +891,30 @@ ufs_stat()
 
 and then any helper it calls, such as path resolution.
 
+For:
+
+```text
+settag /docs/test.txt project
+```
+
+the first suspect is:
+
+```c
+ufs_set_tag()
+```
+
+For:
+
+```text
+findtag project
+```
+
+the first suspect is:
+
+```c
+ufs_find_by_tag()
+```
+
 ### Step 2 — Test the lower-level operation
 
 For example, before testing a complicated file path, verify:
@@ -652,6 +926,19 @@ stat /docs/test.txt
 ```
 
 This identifies where path resolution begins to fail.
+
+For tag functionality, first verify that the target file exists:
+
+```text
+stat /docs/test.txt
+```
+
+Then:
+
+```text
+settag /docs/test.txt project
+findtag project
+```
 
 ### Step 3 — Check the return value
 
@@ -681,7 +968,7 @@ If corruption is suspected, format a new test image and reproduce the smallest s
 
 ---
 
-# 21. Reporting a Bug to the Team
+# 24. Reporting a Bug to the Team
 
 When reporting a problem, provide:
 
@@ -693,6 +980,7 @@ When reporting a problem, provide:
 6. Whether the filesystem was mounted.
 7. Whether `fsck` passed before the failure.
 8. Any relevant source-code changes.
+9. For tag-related problems, the tag value and files that were expected to match.
 
 Example:
 
@@ -704,7 +992,9 @@ Commands:
 
 format filesystem.img 1048576
 mount filesystem.img
-stat /
+create /test.txt
+settag /test.txt project
+findtag project
 ```
 
 Result:
@@ -713,15 +1003,21 @@ Result:
 ERROR: Invalid argument (errno=22)
 ```
 
+Expected:
+
+```text
+/test.txt should be returned as a matching file.
+```
+
 This is much more useful than simply reporting:
 
 ```text
-stat is broken
+tag search is broken
 ```
 
 ---
 
-# 22. Test Completion Checklist
+# 25. Test Completion Checklist
 
 ## Filesystem
 
@@ -747,6 +1043,18 @@ stat is broken
 - [ ] `unlink`
 - [ ] `stat`
 
+## Tags
+
+- [ ] Set a tag on a file
+- [ ] Find files by tag
+- [ ] Multiple files can share a tag
+- [ ] Files with different tags are not returned
+- [ ] Changing a tag updates search results
+- [ ] Searching for a nonexistent tag returns no matches
+- [ ] Tagging a nonexistent file fails appropriately
+- [ ] Tags survive unmount/remount if persistent tag storage is implemented
+- [ ] Deleted files do not remain as valid tag matches
+
 ## File Descriptors
 
 - [ ] `open`
@@ -766,6 +1074,7 @@ stat is broken
 - [ ] Data survives unmount
 - [ ] Data survives remount
 - [ ] Metadata survives remount
+- [ ] Tag information survives remount
 
 ## Allocation
 
@@ -781,11 +1090,12 @@ stat is broken
 - [ ] Duplicate paths
 - [ ] Invalid descriptors
 - [ ] Invalid arguments
+- [ ] Invalid tag operations
 - [ ] Correct `errno` values
 
 ---
 
-# 23. Files in the Project
+# 26. Files in the Project
 
 The intended separation is:
 
@@ -794,7 +1104,7 @@ userfs.c
     ↓
 Actual UserFS implementation
 
-userfs(7).h
+userfs.h
     ↓
 Public UserFS API
 
@@ -810,4 +1120,3 @@ TEAM_TESTING_GUIDE.md
     ↓
 Detailed testing and debugging procedures
 ```
-
