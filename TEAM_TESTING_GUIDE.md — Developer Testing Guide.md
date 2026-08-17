@@ -1095,6 +1095,30 @@ tag search is broken
 
 ---
 
+## Advanced Automated Scenarios (`test_runner.py`)
+
+We have expanded our SDET integration test suite with 4 new robust validation scenarios:
+
+1. **Seek & Truncate (`seek_truncate`)**:
+   - Validates shrinking file payload via `truncate`.
+   - Checks that `stat` reflects the updated size correctly.
+   - Resets read/write pointer using `seek` and verifies that truncated data is safely omitted during read operations.
+
+2. **Directory Robustness (`dir_robustness`)**:
+   - Asserts that removing a non-empty directory (`rmdir`) is correctly rejected by the filesystem guardrails.
+   - Tests error handling when attempting to create files in non-existent paths.
+   - Ensures empty directories are safely removed post-cleanup.
+
+3. **File Descriptor Table Exhaustion (`fd_exhaustion`)**:
+   - Opens `UFS_MAX_OPEN_FILES` (32 files) consecutively.
+   - Asserts that opening the 33rd file is gracefully rejected with an error.
+   - Verifies that closing an active FD frees up a slot, allowing subsequent file opens to succeed.
+
+4. **Indirect Block Allocation (`indirect_blocks`)**:
+   - Writes 6000 bytes to a single file, forcing allocation past the direct block boundary (10 blocks * 512 = 5120 bytes) into the indirect block region.
+   - Confirms `stat` reports the exact size.
+   - Runs `fsck` to validate complete block map and bitmap consistency.
+   
 # 26. Files in the Project
 
 The intended separation is:
