@@ -869,8 +869,11 @@ int ufs_format(const char *image_path, size_t image_size)
         new_sb.block_bitmap_start + new_sb.block_bitmap_blocks;
     new_sb.inode_table_blocks = (uint32_t)(((uint64_t)total_inodes * sizeof(struct ufs_inode) + UFS_BLOCK_SIZE - 1) / UFS_BLOCK_SIZE);
 
-    new_sb.data_start =
-        new_sb.inode_table_start + new_sb.inode_table_blocks;
+    new_sb.journal_blocks = 100;
+    new_sb.journal_start = new_sb.inode_table_start + new_sb.inode_table_blocks;
+
+    new_sb.data_start = new_sb.journal_start + new_sb.journal_blocks;
+    new_sb.data_blocks = total_blocks - new_sb.data_start;
 
     if (new_sb.data_start >= total_blocks)
     {
@@ -972,6 +975,31 @@ int ufs_mount(const char *image_path)
     block_bitmap = malloc(bbmp_bytes);
     fseeko(disk, (off_t)sb.block_bitmap_start * UFS_BLOCK_SIZE, SEEK_SET);
     fread(block_bitmap, 1, bbmp_bytes, disk);
+
+    for (uint32_t i = 0; i < sb.journal_blocks; i += 2)
+    {
+        struct ufs_journal_record j_rec;
+
+        disk_read_block(sb.journal_start + i + 1, &j_rec);
+
+        if (j_rec.magic == UFS_JOURNAL_MAGIC && j_rec.is_commit == 1)
+        {
+
+            void *temp_buf = malloc(512);
+            if (temp_buf)
+            {
+                disk_read_block(sb.journal_start + i, temp_buf);
+
+                disk_write_block(j_rec.target_block, temp_buf);
+
+                free(temp_buf);
+            }
+
+            j_rec.magic = 0;
+            j_rec.is_commit = 0;
+            disk_write_block(sb.journal_start + i + 1, &j_rec);
+        }
+    }
 
     return 0;
 }
@@ -1611,6 +1639,375 @@ off_t ufs_seek(int fd, off_t offset, int whence)
     return new_position;
 }
 
+/* ---- Block-tree geometry ------------------------------------------- */
+
+#define UFS_PTRS_PER_BLOCK (UFS_BLOCK_SIZE / sizeof(uint32_t)) /* 128 */
+#define UFS_DIRECT_COUNT 10u
+
+#define UFS_SINGLE_COUNT (UFS_PTRS_PER_BLOCK)                                           /* 128        */
+#define UFS_DOUBLE_COUNT (UFS_PTRS_PER_BLOCK * UFS_PTRS_PER_BLOCK)                      /* 16 384     */
+#define UFS_TRIPLE_COUNT (UFS_PTRS_PER_BLOCK * UFS_PTRS_PER_BLOCK * UFS_PTRS_PER_BLOCK) /* 2 097 152 */
+
+#define UFS_SINGLE_START (UFS_DIRECT_COUNT)                          /* 10      */
+#define UFS_DOUBLE_START (UFS_SINGLE_START + UFS_SINGLE_COUNT)       /* 138     */
+#define UFS_TRIPLE_START (UFS_DOUBLE_START + UFS_DOUBLE_COUNT)       /* 16 522  */
+#define UFS_MAX_LOGICAL_BLOCKS (UFS_TRIPLE_START + UFS_TRIPLE_COUNT) /* 2 113 674 */
+
+/*
+ * Resolves (and optionally allocates) the block number stored in *slot.
+ * *slot may be a field inside a ufs_inode (indirect_block, ...) or an
+ * entry inside a ptrs[] array read from an index block.
+ *
+ * Returns the block number, or 0 if unallocated (allocate == 0) or on
+ * failure (errno is set to a non-zero value in the failure case only).
+ */
+static uint32_t ufs_bmap_slot(uint32_t *slot, int allocate)
+{
+    if (*slot != 0)
+    {
+        return *slot;
+    }
+
+    if (!allocate)
+    {
+        return 0;
+    }
+
+    int64_t nb = alloc_block();
+    if (nb < 0)
+    {
+        return 0;
+    }
+
+    /* alloc_block() already zero-fills the block on disk. */
+    *slot = (uint32_t)nb;
+    return *slot;
+}
+
+/*
+ * Translates a logical block number of a file into a physical block
+ * number, walking direct / single / double / triple indirect trees.
+ *
+ * allocate == 0: pure lookup. Returns 0 for a hole (errno left at 0) or
+ *                on error (errno set).
+ * allocate == 1: allocates any missing intermediate index blocks and the
+ *                final data block, updating `inode` and the on-disk index
+ *                blocks as needed. Returns 0 only on failure (errno set).
+ */
+static uint32_t ufs_bmap(struct ufs_inode *inode, uint32_t logical_block, int allocate)
+{
+    errno = 0;
+
+    if (logical_block >= UFS_MAX_LOGICAL_BLOCKS)
+    {
+        errno = EFBIG;
+        return 0;
+    }
+
+    /* Direct blocks */
+    if (logical_block < UFS_DIRECT_COUNT)
+    {
+        return ufs_bmap_slot(&inode->direct_blocks[logical_block], allocate);
+    }
+
+    /* Single indirect */
+    if (logical_block < UFS_DOUBLE_START)
+    {
+        uint32_t idx = logical_block - UFS_SINGLE_START;
+
+        uint32_t ind_blk = ufs_bmap_slot(&inode->indirect_block, allocate);
+        if (ind_blk == 0)
+        {
+            return 0;
+        }
+
+        uint32_t ptrs[UFS_PTRS_PER_BLOCK];
+        if (disk_read_block(ind_blk, ptrs) != 0)
+        {
+            return 0;
+        }
+
+        uint32_t data_blk = ufs_bmap_slot(&ptrs[idx], allocate);
+        if (data_blk == 0)
+        {
+            return 0;
+        }
+
+        if (allocate && disk_write_block(ind_blk, ptrs) != 0)
+        {
+            return 0;
+        }
+
+        return data_blk;
+    }
+
+    /* Double indirect */
+    if (logical_block < UFS_TRIPLE_START)
+    {
+        uint32_t rel = logical_block - UFS_DOUBLE_START;
+        uint32_t l1_idx = rel / UFS_PTRS_PER_BLOCK;
+        uint32_t l2_idx = rel % UFS_PTRS_PER_BLOCK;
+
+        uint32_t dbl_blk = ufs_bmap_slot(&inode->double_indirect_block, allocate);
+        if (dbl_blk == 0)
+        {
+            return 0;
+        }
+
+        uint32_t l1_ptrs[UFS_PTRS_PER_BLOCK];
+        if (disk_read_block(dbl_blk, l1_ptrs) != 0)
+        {
+            return 0;
+        }
+
+        uint32_t l1_blk = ufs_bmap_slot(&l1_ptrs[l1_idx], allocate);
+        if (l1_blk == 0)
+        {
+            return 0;
+        }
+        if (allocate && disk_write_block(dbl_blk, l1_ptrs) != 0)
+        {
+            return 0;
+        }
+
+        uint32_t l2_ptrs[UFS_PTRS_PER_BLOCK];
+        if (disk_read_block(l1_blk, l2_ptrs) != 0)
+        {
+            return 0;
+        }
+
+        uint32_t data_blk = ufs_bmap_slot(&l2_ptrs[l2_idx], allocate);
+        if (data_blk == 0)
+        {
+            return 0;
+        }
+        if (allocate && disk_write_block(l1_blk, l2_ptrs) != 0)
+        {
+            return 0;
+        }
+
+        return data_blk;
+    }
+
+    /* Triple indirect */
+    {
+        uint32_t rel = logical_block - UFS_TRIPLE_START;
+        uint32_t l1_idx = rel / UFS_DOUBLE_COUNT;
+        uint32_t rem = rel % UFS_DOUBLE_COUNT;
+        uint32_t l2_idx = rem / UFS_PTRS_PER_BLOCK;
+        uint32_t l3_idx = rem % UFS_PTRS_PER_BLOCK;
+
+        uint32_t tpl_blk = ufs_bmap_slot(&inode->triple_indirect_block, allocate);
+        if (tpl_blk == 0)
+        {
+            return 0;
+        }
+
+        uint32_t l1_ptrs[UFS_PTRS_PER_BLOCK];
+        if (disk_read_block(tpl_blk, l1_ptrs) != 0)
+        {
+            return 0;
+        }
+
+        uint32_t l1_blk = ufs_bmap_slot(&l1_ptrs[l1_idx], allocate);
+        if (l1_blk == 0)
+        {
+            return 0;
+        }
+        if (allocate && disk_write_block(tpl_blk, l1_ptrs) != 0)
+        {
+            return 0;
+        }
+
+        uint32_t l2_ptrs[UFS_PTRS_PER_BLOCK];
+        if (disk_read_block(l1_blk, l2_ptrs) != 0)
+        {
+            return 0;
+        }
+
+        uint32_t l2_blk = ufs_bmap_slot(&l2_ptrs[l2_idx], allocate);
+        if (l2_blk == 0)
+        {
+            return 0;
+        }
+        if (allocate && disk_write_block(l1_blk, l2_ptrs) != 0)
+        {
+            return 0;
+        }
+
+        uint32_t l3_ptrs[UFS_PTRS_PER_BLOCK];
+        if (disk_read_block(l2_blk, l3_ptrs) != 0)
+        {
+            return 0;
+        }
+
+        uint32_t data_blk = ufs_bmap_slot(&l3_ptrs[l3_idx], allocate);
+        if (data_blk == 0)
+        {
+            return 0;
+        }
+        if (allocate && disk_write_block(l2_blk, l3_ptrs) != 0)
+        {
+            return 0;
+        }
+
+        return data_blk;
+    }
+}
+
+/* ---- Freeing helpers -------------------------------------------------
+ *
+ * Frees every allocated block whose logical block number falls in
+ * [free_lo, free_hi), inside the subtree rooted at *block_num_ptr.
+ * The subtree covers the logical range [subtree_base, subtree_base +
+ * subtree_span). child_span == 1 means *block_num_ptr's pointers refer
+ * directly to data blocks (i.e. it is a single-indirect block);
+ * otherwise each pointer refers to another index block one level down.
+ *
+ * Data (and emptied index) blocks are zeroed before being freed, and
+ * the subtree's own block is freed and *block_num_ptr cleared to 0 once
+ * every pointer inside it has been freed. This lets the same routine
+ * both truncate a suffix of a file and delete a tree in full (by
+ * passing the tree's whole range as [free_lo, free_hi)).
+ */
+static void ufs_free_range(uint32_t *block_num_ptr,
+                           uint64_t subtree_base, uint64_t subtree_span,
+                           uint64_t free_lo, uint64_t free_hi)
+{
+    if (*block_num_ptr == 0)
+    {
+        return;
+    }
+
+    if (free_hi <= subtree_base || free_lo >= subtree_base + subtree_span)
+    {
+        return;
+    }
+
+    uint32_t ptrs[UFS_PTRS_PER_BLOCK];
+    if (disk_read_block(*block_num_ptr, ptrs) != 0)
+    {
+        return;
+    }
+
+    uint8_t zeros[UFS_BLOCK_SIZE];
+    memset(zeros, 0, sizeof(zeros));
+
+    uint64_t child_span = subtree_span / UFS_PTRS_PER_BLOCK;
+    int dirty = 0;
+    int any_remaining = 0;
+
+    for (uint32_t i = 0; i < UFS_PTRS_PER_BLOCK; i++)
+    {
+        uint64_t child_base = subtree_base + (uint64_t)i * child_span;
+        uint64_t child_end = child_base + child_span;
+
+        if (free_hi > child_base && free_lo < child_end)
+        {
+            if (child_span == 1)
+            {
+                if (ptrs[i] != 0)
+                {
+                    disk_write_block(ptrs[i], zeros);
+                    free_block(ptrs[i]);
+                    ptrs[i] = 0;
+                    dirty = 1;
+                }
+            }
+            else
+            {
+                ufs_free_range(&ptrs[i], child_base, child_span, free_lo, free_hi);
+                dirty = 1;
+            }
+        }
+
+        if (ptrs[i] != 0)
+        {
+            any_remaining = 1;
+        }
+    }
+
+    if (dirty)
+    {
+        disk_write_block(*block_num_ptr, ptrs);
+    }
+
+    if (!any_remaining)
+    {
+        disk_write_block(*block_num_ptr, zeros);
+        free_block(*block_num_ptr);
+        *block_num_ptr = 0;
+    }
+}
+
+/* Thin, explicit wrappers over ufs_free_range() that free an entire
+ * single / double / triple indirect tree, as requested by
+ * purge_trashed_inode(). */
+static void free_indirect_block(uint32_t *indirect_block_ptr)
+{
+    ufs_free_range(indirect_block_ptr,
+                   UFS_SINGLE_START, UFS_SINGLE_COUNT,
+                   UFS_SINGLE_START, UFS_SINGLE_START + UFS_SINGLE_COUNT);
+}
+
+static void free_double_indirect_block(uint32_t *double_block_ptr)
+{
+    ufs_free_range(double_block_ptr,
+                   UFS_DOUBLE_START, UFS_DOUBLE_COUNT,
+                   UFS_DOUBLE_START, UFS_DOUBLE_START + UFS_DOUBLE_COUNT);
+}
+
+static void free_triple_indirect_block(uint32_t *triple_block_ptr)
+{
+    ufs_free_range(triple_block_ptr,
+                   UFS_TRIPLE_START, UFS_TRIPLE_COUNT,
+                   UFS_TRIPLE_START, UFS_TRIPLE_START + UFS_TRIPLE_COUNT);
+}
+
+/* ---- fsck tree walker --------------------------------------------------
+ * Marks block_num itself in shadow_bbmp, then walks its 128 pointers.
+ * depth == 1: block_num is a single-indirect block -> pointers are data
+ *             blocks, marked directly.
+ * depth == 2: block_num is a double-indirect block -> pointers are
+ *             single-indirect blocks, recursed with depth 1.
+ * depth == 3: block_num is a triple-indirect block -> pointers are
+ *             double-indirect blocks, recursed with depth 2.
+ */
+static void fsck_mark_index_tree(uint32_t block_num, int depth, uint8_t *shadow_bbmp)
+{
+    if (block_num < sb.data_start || block_num >= sb.total_blocks)
+    {
+        return;
+    }
+
+    shadow_bbmp[block_num / 8] |= (uint8_t)(1u << (block_num % 8));
+
+    uint32_t ptrs[UFS_PTRS_PER_BLOCK];
+    if (disk_read_block(block_num, ptrs) != 0)
+    {
+        return;
+    }
+
+    for (uint32_t i = 0; i < UFS_PTRS_PER_BLOCK; i++)
+    {
+        uint32_t child = ptrs[i];
+
+        if (child < sb.data_start || child >= sb.total_blocks)
+        {
+            continue;
+        }
+
+        if (depth == 1)
+        {
+            shadow_bbmp[child / 8] |= (uint8_t)(1u << (child % 8));
+        }
+        else
+        {
+            fsck_mark_index_tree(child, depth - 1, shadow_bbmp);
+        }
+    }
+}
+
 ssize_t ufs_read(int fd, void *buf, size_t count)
 {
     if (disk == NULL)
@@ -1668,7 +2065,6 @@ ssize_t ufs_read(int fd, void *buf, size_t count)
 
     size_t bytes_done = 0;
     uint8_t block_buf[UFS_BLOCK_SIZE];
-    const uint32_t ptrs_per_block = UFS_BLOCK_SIZE / sizeof(uint32_t);
 
     while (bytes_done < to_read)
     {
@@ -1676,32 +2072,14 @@ ssize_t ufs_read(int fd, void *buf, size_t count)
         uint32_t block_index = (uint32_t)(cur / UFS_BLOCK_SIZE);
         uint32_t in_block_off = (uint32_t)(cur % UFS_BLOCK_SIZE);
 
-        uint32_t disk_block = 0;
-        if (block_index < 10)
-        {
-            disk_block = inode.direct_blocks[block_index];
-        }
-        else
-        {
-            uint32_t ind_index = block_index - 10;
-            if (ind_index >= ptrs_per_block)
-            {
-                errno = EFBIG;
-                return -1;
-            }
-            if (inode.indirect_block != 0)
-            {
-                uint32_t ptrs[UFS_BLOCK_SIZE / sizeof(uint32_t)];
-                if (disk_read_block(inode.indirect_block, ptrs) != 0)
-                {
-                    return -1;
-                }
-                disk_block = ptrs[ind_index];
-            }
-        }
+        uint32_t disk_block = ufs_bmap(&inode, block_index, 0);
 
         if (disk_block == 0)
         {
+            if (errno != 0)
+            {
+                return -1;
+            }
 
             memset(block_buf, 0, UFS_BLOCK_SIZE);
         }
@@ -1835,7 +2213,6 @@ ssize_t ufs_write(int fd, const void *buf, size_t count)
 
     size_t bytes_done = 0;
     uint8_t block_buf[UFS_BLOCK_SIZE];
-    const uint32_t ptrs_per_block = UFS_BLOCK_SIZE / sizeof(uint32_t);
 
     while (bytes_done < count)
     {
@@ -1843,57 +2220,10 @@ ssize_t ufs_write(int fd, const void *buf, size_t count)
         uint32_t block_index = (uint32_t)(cur / UFS_BLOCK_SIZE);
         uint32_t in_block_off = (uint32_t)(cur % UFS_BLOCK_SIZE);
 
-        uint32_t disk_block = 0;
-        if (block_index < 10)
+        uint32_t disk_block = ufs_bmap(&inode, block_index, 1);
+        if (disk_block == 0)
         {
-            if (inode.direct_blocks[block_index] == 0)
-            {
-                int64_t nb = alloc_block();
-                if (nb < 0)
-                {
-                    break;
-                }
-                inode.direct_blocks[block_index] = (uint32_t)nb;
-            }
-            disk_block = inode.direct_blocks[block_index];
-        }
-        else
-        {
-            uint32_t ind_index = block_index - 10;
-            if (ind_index >= ptrs_per_block)
-            {
-                errno = EFBIG;
-                break;
-            }
-            if (inode.indirect_block == 0)
-            {
-                int64_t nb = alloc_block();
-                if (nb < 0)
-                {
-                    break;
-                }
-
-                inode.indirect_block = (uint32_t)nb;
-            }
-            uint32_t ptrs[UFS_BLOCK_SIZE / sizeof(uint32_t)];
-            if (disk_read_block(inode.indirect_block, ptrs) != 0)
-            {
-                break;
-            }
-            if (ptrs[ind_index] == 0)
-            {
-                int64_t nb = alloc_block();
-                if (nb < 0)
-                {
-                    break;
-                }
-                ptrs[ind_index] = (uint32_t)nb;
-                if (disk_write_block(inode.indirect_block, ptrs) != 0)
-                {
-                    break;
-                }
-            }
-            disk_block = ptrs[ind_index];
+            break;
         }
 
         size_t chunk = UFS_BLOCK_SIZE - in_block_off;
@@ -1925,36 +2255,33 @@ ssize_t ufs_write(int fd, const void *buf, size_t count)
 
         bytes_done += chunk;
     }
-    
-    
-    
-    
+
     uint64_t new_end = (uint64_t)start_offset + bytes_done;
 
-	if (new_end > inode.size)
-	{
-	    inode.size = new_end;
-	}
-	
-	if (bytes_done > 0)
-	{
-	    inode.modified_at = (int64_t)time(NULL);
-	}
+    if (new_end > inode.size)
+    {
+        inode.size = new_end;
+    }
 
-	if (write_inode(inum, &inode) != 0)
-	{
-    	return -1;
-	}
+    if (bytes_done > 0)
+    {
+        inode.modified_at = (int64_t)time(NULL);
+    }
 
-	open_files[fd].position =
+    if (write_inode(inum, &inode) != 0)
+    {
+        return -1;
+    }
+
+    open_files[fd].position =
         start_offset + (off_t)bytes_done;
 
-	if (bytes_done == 0 && count > 0)
-	{
-  	  return -1;
-	}
+    if (bytes_done == 0 && count > 0)
+    {
+        return -1;
+    }
 
-	return (ssize_t)bytes_done;
+    return (ssize_t)bytes_done;
 }
 
 int ufs_truncate(const char *path, size_t size)
@@ -2038,69 +2365,51 @@ int ufs_truncate(const char *path, size_t size)
 
     if (new_size < inode.size)
     {
-        for (uint32_t bi = new_blocks; bi < old_blocks; bi++)
+        // ==================== [بداية الجزء المضاف] ====================
+        // تصفير بقايا البلوك الأخير لمنع الـ Stale Data عند الاقتصاص
+        uint32_t offset_in_block = (uint32_t)(new_size % UFS_BLOCK_SIZE);
+        if (offset_in_block != 0)
         {
-            uint32_t disk_block = 0;
-            if (bi < 10)
+            uint32_t last_block_idx = (uint32_t)(new_size / UFS_BLOCK_SIZE);
+            uint32_t disk_block = ufs_bmap(&inode, last_block_idx, 0);
+
+            if (disk_block != 0)
             {
-                disk_block = inode.direct_blocks[bi];
-            }
-            else if (inode.indirect_block != 0)
-            {
-                uint32_t ind_index = bi - 10;
-                uint32_t ptrs[UFS_BLOCK_SIZE / sizeof(uint32_t)];
-                if (disk_read_block(inode.indirect_block, ptrs) != 0)
+                uint8_t block_buf[UFS_BLOCK_SIZE];
+                if (disk_read_block(disk_block, block_buf) == 0)
                 {
-                    return -1;
+                    memset(block_buf + offset_in_block, 0, UFS_BLOCK_SIZE - offset_in_block);
+                    if (disk_write_block(disk_block, block_buf) == 0)
+                    {
+                        if (last_block_idx < 10)
+                        {
+                            inode.block_checksums[last_block_idx] = crc32_block(block_buf, UFS_BLOCK_SIZE);
+                        }
+                    }
                 }
-                disk_block = ptrs[ind_index];
             }
+        }
+        // ==================== [نهاية الجزء المضاف] ====================
 
-            if (disk_block == 0)
+        uint64_t free_lo = new_blocks;
+        uint64_t free_hi = old_blocks;
+
+        for (uint32_t bi = new_blocks; bi < old_blocks && bi < UFS_DIRECT_COUNT; bi++)
+        {
+            if (inode.direct_blocks[bi] != 0)
             {
-                continue;
-            }
-
-            free_block(disk_block);
-
-            if (bi < 10)
-            {
+                free_block(inode.direct_blocks[bi]);
                 inode.direct_blocks[bi] = 0;
                 inode.block_checksums[bi] = 0;
             }
-            else if (inode.indirect_block != 0)
-            {
-                uint32_t ind_index = bi - 10;
-                uint32_t ptrs[UFS_BLOCK_SIZE / sizeof(uint32_t)];
-                if (disk_read_block(inode.indirect_block, ptrs) == 0)
-                {
-                    ptrs[ind_index] = 0;
-                    disk_write_block(inode.indirect_block, ptrs);
-                }
-            }
         }
 
-        if (inode.indirect_block != 0 && new_blocks <= 10)
-        {
-            uint32_t ptrs[UFS_BLOCK_SIZE / sizeof(uint32_t)];
-            if (disk_read_block(inode.indirect_block, ptrs) == 0)
-            {
-                int any_used = 0;
-                for (uint32_t i = 0; i < ptrs_per_block; i++)
-                {
-                    if (ptrs[i] != 0)
-                    {
-                        any_used = 1;
-                        break;
-                    }
-                }
-                if (!any_used)
-                {
-                    free_block(inode.indirect_block);
-                    inode.indirect_block = 0;
-                }
-            }
-        }
+        ufs_free_range(&inode.indirect_block,
+                       UFS_SINGLE_START, UFS_SINGLE_COUNT, free_lo, free_hi);
+        ufs_free_range(&inode.double_indirect_block,
+                       UFS_DOUBLE_START, UFS_DOUBLE_COUNT, free_lo, free_hi);
+        ufs_free_range(&inode.triple_indirect_block,
+                       UFS_TRIPLE_START, UFS_TRIPLE_COUNT, free_lo, free_hi);
     }
     else if (new_size > inode.size)
     {
@@ -2109,20 +2418,10 @@ int ufs_truncate(const char *path, size_t size)
         {
             uint32_t old_last_index = (uint32_t)((inode.size - 1) / UFS_BLOCK_SIZE);
 
-            uint32_t disk_block = 0;
-            if (old_last_index < 10)
+            uint32_t disk_block = ufs_bmap(&inode, old_last_index, 0);
+            if (disk_block == 0 && errno != 0)
             {
-                disk_block = inode.direct_blocks[old_last_index];
-            }
-            else if (inode.indirect_block != 0)
-            {
-                uint32_t ind_index = old_last_index - 10;
-                uint32_t ptrs[UFS_BLOCK_SIZE / sizeof(uint32_t)];
-                if (disk_read_block(inode.indirect_block, ptrs) != 0)
-                {
-                    return -1;
-                }
-                disk_block = ptrs[ind_index];
+                return -1;
             }
 
             if (disk_block != 0)
@@ -2149,56 +2448,10 @@ int ufs_truncate(const char *path, size_t size)
 
         for (uint32_t bi = old_blocks; bi < new_blocks; bi++)
         {
-            uint32_t disk_block = 0;
-            if (bi < 10)
+            uint32_t disk_block = ufs_bmap(&inode, bi, 1);
+            if (disk_block == 0)
             {
-                if (inode.direct_blocks[bi] == 0)
-                {
-                    int64_t nb = alloc_block();
-                    if (nb < 0)
-                    {
-                        return -1;
-                    }
-                    inode.direct_blocks[bi] = (uint32_t)nb;
-                }
-                disk_block = inode.direct_blocks[bi];
-            }
-            else
-            {
-                uint32_t ind_index = bi - 10;
-                if (ind_index >= ptrs_per_block)
-                {
-                    errno = EFBIG;
-                    return -1;
-                }
-                if (inode.indirect_block == 0)
-                {
-                    int64_t nb = alloc_block();
-                    if (nb < 0)
-                    {
-                        return -1;
-                    }
-                    inode.indirect_block = (uint32_t)nb;
-                }
-                uint32_t ptrs[UFS_BLOCK_SIZE / sizeof(uint32_t)];
-                if (disk_read_block(inode.indirect_block, ptrs) != 0)
-                {
-                    return -1;
-                }
-                if (ptrs[ind_index] == 0)
-                {
-                    int64_t nb = alloc_block();
-                    if (nb < 0)
-                    {
-                        return -1;
-                    }
-                    ptrs[ind_index] = (uint32_t)nb;
-                    if (disk_write_block(inode.indirect_block, ptrs) != 0)
-                    {
-                        return -1;
-                    }
-                }
-                disk_block = ptrs[ind_index];
+                return -1;
             }
 
             if (disk_write_block(disk_block, zeros) != 0)
@@ -2351,27 +2604,9 @@ static int purge_trashed_inode(uint32_t inum, struct ufs_inode *ino)
         }
     }
 
-    if (ino->indirect_block != 0)
-    {
-        uint32_t block_numbers[UFS_BLOCK_SIZE / sizeof(uint32_t)];
-        size_t count = UFS_BLOCK_SIZE / sizeof(uint32_t);
-
-        if (disk_read_block(ino->indirect_block, block_numbers) == 0)
-        {
-            for (size_t j = 0; j < count; j++)
-            {
-                if (block_numbers[j] != 0)
-                {
-                    disk_write_block(block_numbers[j], zeros);
-                    free_block(block_numbers[j]);
-                }
-            }
-        }
-
-        disk_write_block(ino->indirect_block, zeros);
-        free_block(ino->indirect_block);
-        ino->indirect_block = 0;
-    }
+    free_indirect_block(&ino->indirect_block);
+    free_double_indirect_block(&ino->double_indirect_block);
+    free_triple_indirect_block(&ino->triple_indirect_block);
 
     memset(ino, 0, sizeof(*ino));
 
@@ -2454,25 +2689,10 @@ int ufs_fsck(void)
                 }
             }
 
-            /* Check indirect block (merged from team's work) */
-            if (ino.indirect_block >= sb.data_start && ino.indirect_block < sb.total_blocks)
-            {
-                shadow_bbmp[ino.indirect_block / 8] |= (uint8_t)(1u << (ino.indirect_block % 8));
-
-                uint32_t block_numbers[UFS_BLOCK_SIZE / sizeof(uint32_t)];
-                if (disk_read_block(ino.indirect_block, block_numbers) == 0)
-                {
-                    size_t block_count = UFS_BLOCK_SIZE / sizeof(uint32_t);
-                    for (size_t j = 0; j < block_count; j++)
-                    {
-                        uint32_t blk = block_numbers[j];
-                        if (blk >= sb.data_start && blk < sb.total_blocks)
-                        {
-                            shadow_bbmp[blk / 8] |= (uint8_t)(1u << (blk % 8));
-                        }
-                    }
-                }
-            }
+            /* Check single / double / triple indirect trees */
+            fsck_mark_index_tree(ino.indirect_block, 1, shadow_bbmp);
+            fsck_mark_index_tree(ino.double_indirect_block, 2, shadow_bbmp);
+            fsck_mark_index_tree(ino.triple_indirect_block, 3, shadow_bbmp);
         }
     }
 
