@@ -161,7 +161,7 @@ static int flush_inode_bitmap(void)
 
         buffer = inode_bitmap + (size_t)i * UFS_BLOCK_SIZE;
 
-        write_result = disk_write_block(block_num, buffer);
+        write_result = ufs_journal_add_block(block_num, buffer);
 
         if (write_result != 0)
         {
@@ -185,7 +185,7 @@ static int flush_block_bitmap(void)
 
         buffer = block_bitmap + (size_t)i * UFS_BLOCK_SIZE;
 
-        write_result = disk_write_block(block_num, buffer);
+        write_result = ufs_journal_add_block(block_num, buffer);
 
         if (write_result != 0)
         {
@@ -259,7 +259,7 @@ static int write_inode(uint32_t inum, const struct ufs_inode *in)
 
     memcpy(buf + offset, in, sizeof(struct ufs_inode));
 
-    write_result = disk_write_block(block, buf);
+    write_result = ufs_journal_add_block(block, buf);
 
     if (write_result != 0)
     {
@@ -985,7 +985,7 @@ int ufs_mount(const char *image_path)
         if (j_rec.magic == UFS_JOURNAL_MAGIC && j_rec.is_commit == 1)
         {
 
-            void *temp_buf = malloc(512);
+            void *temp_buf = malloc(UFS_BLOCK_SIZE);
             if (temp_buf)
             {
                 disk_read_block(sb.journal_start + i, temp_buf);
@@ -1073,9 +1073,12 @@ int ufs_mkdir(const char *path)
         return -1;
     }
 
+    ufs_journal_start_txn();
+
     int64_t new_inum = alloc_inode();
     if (new_inum < 0)
     {
+        ufs_journal_abort_txn();
         return -1;
     }
 
@@ -1094,6 +1097,7 @@ int ufs_mkdir(const char *path)
     if (write_inode((uint32_t)new_inum, &new_dir) != 0)
     {
         free_inode((uint32_t)new_inum);
+        ufs_journal_abort_txn();
         return -1;
     }
 
@@ -1104,13 +1108,14 @@ int ufs_mkdir(const char *path)
         write_inode((uint32_t)new_inum, &new_dir);
         free_inode((uint32_t)new_inum);
         errno = saved_errno;
+        ufs_journal_abort_txn();
         return -1;
     }
 
     parent.modified_at = (int64_t)time(NULL);
     write_inode(parent_inum, &parent);
 
-    return 0;
+    return ufs_journal_commit_txn();
 }
 
 int ufs_rmdir(const char *path)
@@ -1171,15 +1176,17 @@ int ufs_rmdir(const char *path)
         return -1;
     }
 
+    ufs_journal_start_txn();
+
     if (dir_remove_entry(&parent, name) != 0)
     {
+        ufs_journal_abort_txn();
         return -1;
     }
 
     parent.modified_at = (int64_t)time(NULL);
     write_inode(parent_inum, &parent);
 
-    /* Free any (empty) data blocks the directory still owns. */
     for (uint32_t b = 0; b < target.block_count && b < 10; b++)
     {
         if (target.direct_blocks[b] != 0)
@@ -1193,7 +1200,7 @@ int ufs_rmdir(const char *path)
     write_inode(target_inum, &target);
     free_inode(target_inum);
 
-    return 0;
+    return ufs_journal_commit_txn();
 }
 
 int ufs_listdir(const char *path, struct ufs_dirent *entries, size_t max_entries)
@@ -1333,10 +1340,13 @@ int ufs_create(const char *path)
         return -1;
     }
 
+    ufs_journal_start_txn();
+
     new_inum = alloc_inode();
 
     if (new_inum < 0)
     {
+        ufs_journal_abort_txn();
         return -1;
     }
 
@@ -1369,6 +1379,7 @@ int ufs_create(const char *path)
     if (result != 0)
     {
         free_inode(target_inum);
+        ufs_journal_abort_txn();
         return -1;
     }
 
@@ -1381,6 +1392,7 @@ int ufs_create(const char *path)
     if (result != 0)
     {
         free_inode(target_inum);
+        ufs_journal_abort_txn();
         return -1;
     }
 
@@ -1392,10 +1404,11 @@ int ufs_create(const char *path)
 
     if (result != 0)
     {
+        ufs_journal_abort_txn();
         return -1;
     }
 
-    return 0;
+    return ufs_journal_commit_txn();
 }
 
 int ufs_unlink(const char *path)
@@ -1480,12 +1493,15 @@ int ufs_unlink(const char *path)
         return -1;
     }
 
+    ufs_journal_start_txn();
+
     result = dir_remove_entry(
         &parent,
         name);
 
     if (result != 0)
     {
+        ufs_journal_abort_txn();
         return -1;
     }
 
@@ -1497,6 +1513,7 @@ int ufs_unlink(const char *path)
 
     if (result != 0)
     {
+        ufs_journal_abort_txn();
         return -1;
     }
 
@@ -1509,10 +1526,11 @@ int ufs_unlink(const char *path)
 
     if (result != 0)
     {
+        ufs_journal_abort_txn();
         return -1;
     }
 
-    return 0;
+    return ufs_journal_commit_txn();
 }
 
 // 4
@@ -2284,6 +2302,110 @@ ssize_t ufs_write(int fd, const void *buf, size_t count)
     return (ssize_t)bytes_done;
 }
 
+#define MAX_TXN_BLOCKS 128
+
+typedef struct
+{
+    uint32_t dest_blocks[MAX_TXN_BLOCKS];
+    uint8_t block_data[MAX_TXN_BLOCKS][UFS_BLOCK_SIZE];
+    uint32_t block_count;
+    uint8_t is_active;
+} ufs_journal_txn_t;
+
+static ufs_journal_txn_t current_txn = {0};
+
+void ufs_journal_start_txn(void)
+{
+    current_txn.block_count = 0;
+    current_txn.is_active = 1;
+}
+
+int ufs_journal_add_block(uint32_t block_num, const uint8_t *data)
+{
+    if (!current_txn.is_active)
+    {
+        return disk_write_block(block_num, data);
+    }
+
+    if (current_txn.block_count >= MAX_TXN_BLOCKS)
+    {
+        return -1;
+    }
+
+    current_txn.dest_blocks[current_txn.block_count] = block_num;
+    memcpy(current_txn.block_data[current_txn.block_count], data, UFS_BLOCK_SIZE);
+    current_txn.block_count++;
+    return 0;
+}
+
+int ufs_journal_commit_txn(void)
+{
+    if (!current_txn.is_active || current_txn.block_count == 0)
+    {
+        current_txn.is_active = 0;
+        return 0;
+    }
+
+    uint32_t j_idx = 0;
+    for (uint32_t i = 0; i < current_txn.block_count; i++)
+    {
+        if (j_idx + 1 >= sb.journal_blocks)
+        {
+            break;
+        }
+
+        struct ufs_journal_record j_rec;
+        memset(&j_rec, 0, sizeof(j_rec));
+        j_rec.magic = UFS_JOURNAL_MAGIC;
+        j_rec.is_commit = 1;
+        j_rec.target_block = current_txn.dest_blocks[i];
+
+        if (disk_write_block(sb.journal_start + j_idx, current_txn.block_data[i]) != 0)
+        {
+            return -1;
+        }
+        if (disk_write_block(sb.journal_start + j_idx + 1, &j_rec) != 0)
+        {
+            return -1;
+        }
+
+        j_idx += 2;
+    }
+
+    for (uint32_t i = 0; i < current_txn.block_count; i++)
+    {
+        if (disk_write_block(current_txn.dest_blocks[i], current_txn.block_data[i]) != 0)
+        {
+            return -1;
+        }
+    }
+
+    j_idx = 0;
+    for (uint32_t i = 0; i < current_txn.block_count; i++)
+    {
+        if (j_idx + 1 >= sb.journal_blocks)
+        {
+            break;
+        }
+
+        struct ufs_journal_record j_rec;
+        memset(&j_rec, 0, sizeof(j_rec));
+        disk_write_block(sb.journal_start + j_idx + 1, &j_rec);
+
+        j_idx += 2;
+    }
+
+    current_txn.is_active = 0;
+    current_txn.block_count = 0;
+    return 0;
+}
+
+void ufs_journal_abort_txn(void)
+{
+    current_txn.is_active = 0;
+    current_txn.block_count = 0;
+}
+
 int ufs_truncate(const char *path, size_t size)
 {
     if (disk == NULL)
@@ -2312,6 +2434,8 @@ int ufs_truncate(const char *path, size_t size)
 
     uint64_t new_size = (uint64_t)size;
 
+    ufs_journal_start_txn();
+
     if (inode.flags & UFS_INODE_FLAG_INLINE_DATA)
     {
         if (new_size <= UFS_INLINE_DATA_MAX_SIZE)
@@ -2330,10 +2454,11 @@ int ufs_truncate(const char *path, size_t size)
 
             if (write_inode(inum, &inode) != 0)
             {
+                ufs_journal_abort_txn();
                 return -1;
             }
 
-            return 0;
+            return ufs_journal_commit_txn();
         }
 
         uint8_t evict_block[UFS_BLOCK_SIZE];
@@ -2343,12 +2468,14 @@ int ufs_truncate(const char *path, size_t size)
         int64_t nb = alloc_block();
         if (nb < 0)
         {
+            ufs_journal_abort_txn();
             return -1;
         }
 
-        if (disk_write_block((uint64_t)nb, evict_block) != 0)
+        if (ufs_journal_add_block((uint32_t)nb, evict_block) != 0)
         {
             free_block((uint64_t)nb);
+            ufs_journal_abort_txn();
             return -1;
         }
 
@@ -2358,15 +2485,11 @@ int ufs_truncate(const char *path, size_t size)
         inode.flags &= ~UFS_INODE_FLAG_INLINE_DATA;
     }
 
-    const uint32_t ptrs_per_block = UFS_BLOCK_SIZE / sizeof(uint32_t);
-
     uint32_t old_blocks = (uint32_t)((inode.size + UFS_BLOCK_SIZE - 1) / UFS_BLOCK_SIZE);
     uint32_t new_blocks = (uint32_t)((new_size + UFS_BLOCK_SIZE - 1) / UFS_BLOCK_SIZE);
 
     if (new_size < inode.size)
     {
-        // ==================== [بداية الجزء المضاف] ====================
-        // تصفير بقايا البلوك الأخير لمنع الـ Stale Data عند الاقتصاص
         uint32_t offset_in_block = (uint32_t)(new_size % UFS_BLOCK_SIZE);
         if (offset_in_block != 0)
         {
@@ -2379,7 +2502,7 @@ int ufs_truncate(const char *path, size_t size)
                 if (disk_read_block(disk_block, block_buf) == 0)
                 {
                     memset(block_buf + offset_in_block, 0, UFS_BLOCK_SIZE - offset_in_block);
-                    if (disk_write_block(disk_block, block_buf) == 0)
+                    if (ufs_journal_add_block(disk_block, block_buf) == 0)
                     {
                         if (last_block_idx < 10)
                         {
@@ -2389,7 +2512,6 @@ int ufs_truncate(const char *path, size_t size)
                 }
             }
         }
-        // ==================== [نهاية الجزء المضاف] ====================
 
         uint64_t free_lo = new_blocks;
         uint64_t free_hi = old_blocks;
@@ -2404,12 +2526,9 @@ int ufs_truncate(const char *path, size_t size)
             }
         }
 
-        ufs_free_range(&inode.indirect_block,
-                       UFS_SINGLE_START, UFS_SINGLE_COUNT, free_lo, free_hi);
-        ufs_free_range(&inode.double_indirect_block,
-                       UFS_DOUBLE_START, UFS_DOUBLE_COUNT, free_lo, free_hi);
-        ufs_free_range(&inode.triple_indirect_block,
-                       UFS_TRIPLE_START, UFS_TRIPLE_COUNT, free_lo, free_hi);
+        ufs_free_range(&inode.indirect_block, UFS_SINGLE_START, UFS_SINGLE_COUNT, free_lo, free_hi);
+        ufs_free_range(&inode.double_indirect_block, UFS_DOUBLE_START, UFS_DOUBLE_COUNT, free_lo, free_hi);
+        ufs_free_range(&inode.triple_indirect_block, UFS_TRIPLE_START, UFS_TRIPLE_COUNT, free_lo, free_hi);
     }
     else if (new_size > inode.size)
     {
@@ -2417,10 +2536,11 @@ int ufs_truncate(const char *path, size_t size)
         if (inode.size > 0 && old_tail_off != 0)
         {
             uint32_t old_last_index = (uint32_t)((inode.size - 1) / UFS_BLOCK_SIZE);
-
             uint32_t disk_block = ufs_bmap(&inode, old_last_index, 0);
+
             if (disk_block == 0 && errno != 0)
             {
+                ufs_journal_abort_txn();
                 return -1;
             }
 
@@ -2429,11 +2549,14 @@ int ufs_truncate(const char *path, size_t size)
                 uint8_t block_buf[UFS_BLOCK_SIZE];
                 if (disk_read_block(disk_block, block_buf) != 0)
                 {
+                    ufs_journal_abort_txn();
                     return -1;
                 }
                 memset(block_buf + old_tail_off, 0, UFS_BLOCK_SIZE - old_tail_off);
-                if (disk_write_block(disk_block, block_buf) != 0)
+
+                if (ufs_journal_add_block(disk_block, block_buf) != 0)
                 {
+                    ufs_journal_abort_txn();
                     return -1;
                 }
                 if (old_last_index < 10)
@@ -2451,11 +2574,13 @@ int ufs_truncate(const char *path, size_t size)
             uint32_t disk_block = ufs_bmap(&inode, bi, 1);
             if (disk_block == 0)
             {
+                ufs_journal_abort_txn();
                 return -1;
             }
 
-            if (disk_write_block(disk_block, zeros) != 0)
+            if (ufs_journal_add_block(disk_block, zeros) != 0)
             {
+                ufs_journal_abort_txn();
                 return -1;
             }
 
@@ -2470,10 +2595,11 @@ int ufs_truncate(const char *path, size_t size)
     inode.modified_at = (int64_t)time(NULL);
     if (write_inode(inum, &inode) != 0)
     {
+        ufs_journal_abort_txn();
         return -1;
     }
 
-    return 0;
+    return ufs_journal_commit_txn();
 }
 
 int ufs_find_by_tag(const char *tag, uint32_t *matching_inums, size_t max_results)
