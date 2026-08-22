@@ -16,6 +16,11 @@
 #define EUCLEAN 117
 #endif
 
+void ufs_journal_start_txn(void);
+int ufs_journal_add_block(uint32_t block_num, const uint8_t *data);
+int ufs_journal_commit_txn(void);
+void ufs_journal_abort_txn(void);
+
 static uint32_t crc32_block(const uint8_t *data, size_t len)
 {
     uint32_t crc = 0xFFFFFFFFu;
@@ -38,6 +43,18 @@ static struct ufs_superblock sb;
 static struct ufs_open_file open_files[UFS_MAX_OPEN_FILES];
 static uint8_t *inode_bitmap;
 static uint8_t *block_bitmap;
+
+#define MAX_TXN_BLOCKS 128
+
+typedef struct
+{
+    uint32_t dest_blocks[MAX_TXN_BLOCKS];
+    uint8_t block_data[MAX_TXN_BLOCKS][UFS_BLOCK_SIZE];
+    uint32_t block_count;
+    uint8_t is_active;
+} ufs_journal_txn_t;
+
+static ufs_journal_txn_t current_txn = {0};
 
 static void bitmap_set(uint8_t *bitmap, uint64_t index)
 {
@@ -250,6 +267,18 @@ static int write_inode(uint32_t inum, const struct ufs_inode *in)
     offset = (inum % UFS_INODES_PER_BLOCK) *
              sizeof(struct ufs_inode);
 
+    if (current_txn.is_active)
+    {
+        for (uint32_t i = 0; i < current_txn.block_count; i++)
+        {
+            if (current_txn.dest_blocks[i] == block)
+            {
+                memcpy(buf, current_txn.block_data[i], UFS_BLOCK_SIZE);
+                goto apply_inode_write;
+            }
+        }
+    }
+
     read_result = disk_read_block(block, buf);
 
     if (read_result != 0)
@@ -257,6 +286,7 @@ static int write_inode(uint32_t inum, const struct ufs_inode *in)
         return -1;
     }
 
+apply_inode_write:
     memcpy(buf + offset, in, sizeof(struct ufs_inode));
 
     write_result = ufs_journal_add_block(block, buf);
@@ -2302,18 +2332,6 @@ ssize_t ufs_write(int fd, const void *buf, size_t count)
     return (ssize_t)bytes_done;
 }
 
-#define MAX_TXN_BLOCKS 128
-
-typedef struct
-{
-    uint32_t dest_blocks[MAX_TXN_BLOCKS];
-    uint8_t block_data[MAX_TXN_BLOCKS][UFS_BLOCK_SIZE];
-    uint32_t block_count;
-    uint8_t is_active;
-} ufs_journal_txn_t;
-
-static ufs_journal_txn_t current_txn = {0};
-
 void ufs_journal_start_txn(void)
 {
     current_txn.block_count = 0;
@@ -2325,6 +2343,15 @@ int ufs_journal_add_block(uint32_t block_num, const uint8_t *data)
     if (!current_txn.is_active)
     {
         return disk_write_block(block_num, data);
+    }
+
+    for (uint32_t i = 0; i < current_txn.block_count; i++)
+    {
+        if (current_txn.dest_blocks[i] == block_num)
+        {
+            memcpy(current_txn.block_data[i], data, UFS_BLOCK_SIZE);
+            return 0;
+        }
     }
 
     if (current_txn.block_count >= MAX_TXN_BLOCKS)
