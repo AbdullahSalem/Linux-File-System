@@ -1516,13 +1516,6 @@ int ufs_unlink(const char *path)
         return -1;
     }
 
-    if (target.double_indirect_block != 0 ||
-        target.triple_indirect_block != 0)
-    {
-        errno = EFBIG;
-        return -1;
-    }
-
     ufs_journal_start_txn();
 
     result = dir_remove_entry(

@@ -54,6 +54,7 @@ EUCLEAN_RE = re.compile(r"(euclean|crc|checksum|corrupt(?:ion)?)", re.I)
 FD_RE = re.compile(r"(?:file\s+descriptor|fd)\s*[:=]?\s*(\d+)", re.I)
 SIZE_RE = re.compile(r"size\s*[:=]?\s*(\d+)", re.I)
 
+UFS_BLOCK_SIZE = 512
 
 def extract_fd(output: str) -> Optional[int]:
     """Parse a numeric file descriptor from shell output without crashing."""
