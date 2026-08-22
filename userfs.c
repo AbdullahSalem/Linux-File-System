@@ -39,6 +39,14 @@ static struct ufs_open_file open_files[UFS_MAX_OPEN_FILES];
 static uint8_t *inode_bitmap;
 static uint8_t *block_bitmap;
 
+/* Forward declarations for the journal (defined further down). */
+static void ufs_journal_track_alloc(uint32_t block_num);
+static int ufs_journal_try_read(uint64_t block_num, void *buf);
+void ufs_journal_start_txn(void);
+int ufs_journal_add_block(uint32_t block_num, const uint8_t *data);
+int ufs_journal_commit_txn(void);
+void ufs_journal_abort_txn(void);
+
 static void bitmap_set(uint8_t *bitmap, uint64_t index)
 {
     bitmap[index / 8] |= (uint8_t)(1u << (index % 8));
@@ -86,6 +94,11 @@ static int disk_read_block(uint64_t block_num, void *buf)
     {
         errno = EBADF;
         return -1;
+    }
+
+    if (ufs_journal_try_read(block_num, buf))
+    {
+        return 0;
     }
 
     offset = (off_t)(block_num * UFS_BLOCK_SIZE);
@@ -332,6 +345,8 @@ static int64_t alloc_block(void)
     uint8_t zero[UFS_BLOCK_SIZE];
     memset(zero, 0, sizeof(zero));
     disk_write_block((uint64_t)idx, zero);
+
+    ufs_journal_track_alloc((uint32_t)idx);
 
     return (int64_t)idx;
 }
@@ -1486,12 +1501,11 @@ int ufs_unlink(const char *path)
         return -1;
     }
 
-    if (target.double_indirect_block != 0 ||
-        target.triple_indirect_block != 0)
-    {
-        errno = EFBIG;
-        return -1;
-    }
+    /* No size restriction here: unlink() only removes the directory entry
+     * and marks the inode TRASHED/expiring. The actual block tree --
+     * direct, single, double, and triple indirect alike -- is torn down
+     * later by purge_trashed_inode() (via ufs_fsck()) once the retention
+     * window elapses, exactly the same way regardless of file size. */
 
     ufs_journal_start_txn();
 
@@ -1751,7 +1765,7 @@ static uint32_t ufs_bmap(struct ufs_inode *inode, uint32_t logical_block, int al
             return 0;
         }
 
-        if (allocate && disk_write_block(ind_blk, ptrs) != 0)
+        if (allocate && ufs_journal_add_block(ind_blk, (const uint8_t *)ptrs) != 0)
         {
             return 0;
         }
@@ -1783,7 +1797,7 @@ static uint32_t ufs_bmap(struct ufs_inode *inode, uint32_t logical_block, int al
         {
             return 0;
         }
-        if (allocate && disk_write_block(dbl_blk, l1_ptrs) != 0)
+        if (allocate && ufs_journal_add_block(dbl_blk, (const uint8_t *)l1_ptrs) != 0)
         {
             return 0;
         }
@@ -1799,7 +1813,7 @@ static uint32_t ufs_bmap(struct ufs_inode *inode, uint32_t logical_block, int al
         {
             return 0;
         }
-        if (allocate && disk_write_block(l1_blk, l2_ptrs) != 0)
+        if (allocate && ufs_journal_add_block(l1_blk, (const uint8_t *)l2_ptrs) != 0)
         {
             return 0;
         }
@@ -1832,7 +1846,7 @@ static uint32_t ufs_bmap(struct ufs_inode *inode, uint32_t logical_block, int al
         {
             return 0;
         }
-        if (allocate && disk_write_block(tpl_blk, l1_ptrs) != 0)
+        if (allocate && ufs_journal_add_block(tpl_blk, (const uint8_t *)l1_ptrs) != 0)
         {
             return 0;
         }
@@ -1848,7 +1862,7 @@ static uint32_t ufs_bmap(struct ufs_inode *inode, uint32_t logical_block, int al
         {
             return 0;
         }
-        if (allocate && disk_write_block(l1_blk, l2_ptrs) != 0)
+        if (allocate && ufs_journal_add_block(l1_blk, (const uint8_t *)l2_ptrs) != 0)
         {
             return 0;
         }
@@ -1864,7 +1878,7 @@ static uint32_t ufs_bmap(struct ufs_inode *inode, uint32_t logical_block, int al
         {
             return 0;
         }
-        if (allocate && disk_write_block(l2_blk, l3_ptrs) != 0)
+        if (allocate && ufs_journal_add_block(l2_blk, (const uint8_t *)l3_ptrs) != 0)
         {
             return 0;
         }
@@ -2175,6 +2189,8 @@ ssize_t ufs_write(int fd, const void *buf, size_t count)
         return -1;
     }
 
+    ufs_journal_start_txn();
+
     off_t start_offset = open_files[fd].position;
     if (open_files[fd].flags & UFS_O_APPEND)
     {
@@ -2199,11 +2215,12 @@ ssize_t ufs_write(int fd, const void *buf, size_t count)
 
             if (write_inode(inum, &inode) != 0)
             {
+                ufs_journal_abort_txn();
                 return -1;
             }
 
             open_files[fd].position = start_offset + (off_t)count;
-            return (ssize_t)count;
+            return ufs_journal_commit_txn() == 0 ? (ssize_t)count : -1;
         }
 
         int64_t nb = alloc_block();
@@ -2310,13 +2327,28 @@ typedef struct
     uint8_t block_data[MAX_TXN_BLOCKS][UFS_BLOCK_SIZE];
     uint32_t block_count;
     uint8_t is_active;
+
+    /* Blocks allocated (via alloc_block()) while this transaction is
+     * active. On abort, every one of these is freed again so a failed
+     * operation never leaks/orphans a block. */
+    uint32_t allocated_blocks[MAX_TXN_BLOCKS];
+    uint32_t allocated_count;
 } ufs_journal_txn_t;
 
 static ufs_journal_txn_t current_txn = {0};
 
+static void ufs_journal_track_alloc(uint32_t block_num)
+{
+    if (current_txn.is_active && current_txn.allocated_count < MAX_TXN_BLOCKS)
+    {
+        current_txn.allocated_blocks[current_txn.allocated_count++] = block_num;
+    }
+}
+
 void ufs_journal_start_txn(void)
 {
     current_txn.block_count = 0;
+    current_txn.allocated_count = 0;
     current_txn.is_active = 1;
 }
 
@@ -2343,67 +2375,106 @@ int ufs_journal_commit_txn(void)
     if (!current_txn.is_active || current_txn.block_count == 0)
     {
         current_txn.is_active = 0;
+        current_txn.allocated_count = 0;
         return 0;
     }
 
-    uint32_t j_idx = 0;
-    for (uint32_t i = 0; i < current_txn.block_count; i++)
+    /* The on-disk journal holds sb.journal_blocks/2 (data,record) slots.
+     * A transaction may touch more blocks than that fits in one pass, so
+     * we commit it in journal-sized batches: journal-write batch N,
+     * apply batch N, clear batch N's records, THEN move to batch N+1.
+     * Every block that ever reaches its real destination is therefore
+     * always preceded by a durable journal entry, regardless of how many
+     * blocks the overall transaction touches. */
+    uint32_t max_slots = sb.journal_blocks / 2;
+    if (max_slots == 0)
     {
-        if (j_idx + 1 >= sb.journal_blocks)
-        {
-            break;
-        }
-
-        struct ufs_journal_record j_rec;
-        memset(&j_rec, 0, sizeof(j_rec));
-        j_rec.magic = UFS_JOURNAL_MAGIC;
-        j_rec.is_commit = 1;
-        j_rec.target_block = current_txn.dest_blocks[i];
-
-        if (disk_write_block(sb.journal_start + j_idx, current_txn.block_data[i]) != 0)
-        {
-            return -1;
-        }
-        if (disk_write_block(sb.journal_start + j_idx + 1, &j_rec) != 0)
-        {
-            return -1;
-        }
-
-        j_idx += 2;
+        current_txn.is_active = 0;
+        current_txn.block_count = 0;
+        current_txn.allocated_count = 0;
+        errno = ENOSPC;
+        return -1;
     }
 
-    for (uint32_t i = 0; i < current_txn.block_count; i++)
+    uint32_t processed = 0;
+    while (processed < current_txn.block_count)
     {
-        if (disk_write_block(current_txn.dest_blocks[i], current_txn.block_data[i]) != 0)
+        uint32_t batch = current_txn.block_count - processed;
+        if (batch > max_slots)
         {
-            return -1;
-        }
-    }
-
-    j_idx = 0;
-    for (uint32_t i = 0; i < current_txn.block_count; i++)
-    {
-        if (j_idx + 1 >= sb.journal_blocks)
-        {
-            break;
+            batch = max_slots;
         }
 
-        struct ufs_journal_record j_rec;
-        memset(&j_rec, 0, sizeof(j_rec));
-        disk_write_block(sb.journal_start + j_idx + 1, &j_rec);
+        uint32_t j_idx = 0;
+        for (uint32_t i = 0; i < batch; i++)
+        {
+            struct ufs_journal_record j_rec;
+            memset(&j_rec, 0, sizeof(j_rec));
+            j_rec.magic = UFS_JOURNAL_MAGIC;
+            j_rec.is_commit = 1;
+            j_rec.target_block = current_txn.dest_blocks[processed + i];
 
-        j_idx += 2;
+            if (disk_write_block(sb.journal_start + j_idx, current_txn.block_data[processed + i]) != 0)
+            {
+                current_txn.is_active = 0;
+                current_txn.block_count = 0;
+                current_txn.allocated_count = 0;
+                return -1;
+            }
+            if (disk_write_block(sb.journal_start + j_idx + 1, &j_rec) != 0)
+            {
+                current_txn.is_active = 0;
+                current_txn.block_count = 0;
+                current_txn.allocated_count = 0;
+                return -1;
+            }
+
+            j_idx += 2;
+        }
+
+        for (uint32_t i = 0; i < batch; i++)
+        {
+            if (disk_write_block(current_txn.dest_blocks[processed + i], current_txn.block_data[processed + i]) != 0)
+            {
+                current_txn.is_active = 0;
+                current_txn.block_count = 0;
+                current_txn.allocated_count = 0;
+                return -1;
+            }
+        }
+
+        j_idx = 0;
+        for (uint32_t i = 0; i < batch; i++)
+        {
+            struct ufs_journal_record j_rec;
+            memset(&j_rec, 0, sizeof(j_rec));
+            disk_write_block(sb.journal_start + j_idx + 1, &j_rec);
+
+            j_idx += 2;
+        }
+
+        processed += batch;
     }
 
     current_txn.is_active = 0;
     current_txn.block_count = 0;
+    current_txn.allocated_count = 0;
     return 0;
 }
 
 void ufs_journal_abort_txn(void)
 {
+    /* True rollback: undo every block allocation made while this
+     * transaction was active, so a failed operation never leaks a block
+     * that fsck has to notice and repair after the fact. */
+    for (uint32_t i = 0; i < current_txn.allocated_count; i++)
+    {
+        free_block(current_txn.allocated_blocks[i]);
+    }
+
     current_txn.is_active = 0;
     current_txn.block_count = 0;
+    current_txn.allocated_count = 0;
 }
 
 int ufs_truncate(const char *path, size_t size)

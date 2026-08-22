@@ -119,10 +119,14 @@ struct ufs_open_file
 struct ufs_journal_record
 {
     uint32_t magic;
+    uint32_t _pad;
     uint64_t target_block;
     uint32_t transaction_id;
     uint32_t is_commit;
-    uint8_t padding[492];
+    uint8_t padding[488];
 };
+
+_Static_assert(sizeof(struct ufs_journal_record) == 512,
+               "ufs_journal_record must be exactly one block");
 
 #endif

@@ -17,6 +17,7 @@ import os
 import platform
 import queue
 import re
+import struct
 import subprocess
 import sys
 import threading
@@ -679,17 +680,515 @@ def scenario_indirect_blocks(binary: str, image: str, size_mb: int = 1) -> bool:
         sh.close()
     return rpt.finalize()
 
+# =====================================================================
+# ADVANCED SCENARIOS: indirect-block boundaries, journal capacity/
+# rollback, mount-time replay, CRC coverage gap, forced trash expiry.
+#
+# The disk-patching helpers below assume standard x86-64 GCC/Clang
+# struct alignment (no #pragma pack in ufs_internal.h), independently
+# verified against the header's own _Static_assert(sizeof(ufs_inode)==256)
+# and _Static_assert(sizeof(ufs_superblock)==512). verify_superblock_layout()
+# double-checks this against the real magic number before any scenario
+# trusts it, so a wrong assumption fails loudly instead of silently
+# corrupting the image.
+# =====================================================================
+
+UFS_JOURNAL_MAGIC = 0x4A524E4C
+UFS_MAGIC = 0x55465331
+INODE_SIZE = 256
+EXPIRY_TIME_OFFSET = 128  # int64_t, see ufs_inode layout write-up
+
+SB_FMT = "<IIQIIIIIIIxxxxQQIIII432s"
+SB_FIELDS = [
+    "magic", "block_size", "total_blocks", "total_inodes",
+    "inode_bitmap_start", "inode_bitmap_blocks",
+    "block_bitmap_start", "block_bitmap_blocks",
+    "inode_table_start", "inode_table_blocks",
+    "data_start", "data_blocks", "root_inode", "version",
+    "journal_start", "journal_blocks", "reserved",
+]
+
+
+def read_superblock(image_path):
+    with open(image_path, "rb") as f:
+        raw = f.read(512)
+    vals = struct.unpack(SB_FMT, raw)
+    sb = dict(zip(SB_FIELDS, vals))
+    if sb["magic"] != UFS_MAGIC:
+        raise ValueError(f"superblock magic mismatch: {sb['magic']:#x} != {UFS_MAGIC:#x} "
+                          f"(struct layout assumption may be wrong for this build)")
+    return sb
+
+
+def verify_superblock_layout(image_path):
+    sb = read_superblock(image_path)
+    assert sb["block_size"] == UFS_BLOCK_SIZE
+    assert sb["inode_table_start"] > sb["block_bitmap_start"] > sb["inode_bitmap_start"] > 0
+    assert sb["data_start"] > sb["journal_start"] > sb["inode_table_start"]
+    return sb
+
+
+def inode_byte_offset(sb, inum):
+    inodes_per_block = UFS_BLOCK_SIZE // INODE_SIZE  # 2
+    block = sb["inode_table_start"] + inum // inodes_per_block
+    off_in_block = (inum % inodes_per_block) * INODE_SIZE
+    return block * UFS_BLOCK_SIZE + off_in_block
+
+
+def patch_inode_field(image_path, sb, inum, field_offset, fmt, value):
+    """Directly overwrite one field of one on-disk inode. Image must be
+    UNMOUNTED (same pattern as scenario_corruption's bit-flip)."""
+    base = inode_byte_offset(sb, inum)
+    with open(image_path, "r+b") as f:
+        f.seek(base + field_offset)
+        f.write(struct.pack(fmt, value))
+
+
+def find_inum_by_name(image_path, sb, name):
+    with open(image_path, "rb") as f:
+        for inum in range(sb["total_inodes"]):
+            f.seek(inode_byte_offset(sb, inum))
+            raw = f.read(INODE_SIZE)
+            used, _itype = struct.unpack_from("<II", raw, 0)
+            if not used:
+                continue
+            nm = raw[8:8 + 32].split(b"\x00", 1)[0].decode(errors="replace")
+            if nm == name:
+                return inum
+    return None
+
+
+def craft_journal_pair(image_path, sb, slot_index, target_block, payload):
+    """Write a hand-crafted (data, commit-record) pair directly into
+    journal slot `slot_index`, simulating a crash that occurred after
+    journal-write but before/during apply-to-target. Image must be
+    UNMOUNTED."""
+    assert len(payload) == UFS_BLOCK_SIZE
+    j_data_block = sb["journal_start"] + slot_index * 2
+    j_rec_block = j_data_block + 1
+
+    record = struct.pack("<I4xQII488s", UFS_JOURNAL_MAGIC, target_block, 1, 1, b"\x00" * 488)
+    assert len(record) == UFS_BLOCK_SIZE
+
+    with open(image_path, "r+b") as f:
+        f.seek(j_data_block * UFS_BLOCK_SIZE)
+        f.write(payload)
+        f.seek(j_rec_block * UFS_BLOCK_SIZE)
+        f.write(record)
+
+
+def read_raw_block(image_path, block_num):
+    with open(image_path, "rb") as f:
+        f.seek(block_num * UFS_BLOCK_SIZE)
+        return f.read(UFS_BLOCK_SIZE)
+
+
+def free_block_count(image_path, sb):
+    with open(image_path, "rb") as f:
+        f.seek(sb["block_bitmap_start"] * UFS_BLOCK_SIZE)
+        bitmap = f.read(sb["block_bitmap_blocks"] * UFS_BLOCK_SIZE)
+    free = 0
+    for i in range(sb["total_blocks"]):
+        if not (bitmap[i // 8] >> (i % 8)) & 1:
+            free += 1
+    return free
+
+
+def scenario_boundary_crossing_writes(binary: str, image: str, size_mb: int = 20) -> bool:
+    header("SCENARIO: DIRECT -> SINGLE -> DOUBLE -> TRIPLE BOUNDARY CROSSING")
+    fresh_image(image)
+    rpt = Report("boundary_crossing_writes")
+    sh = ShellSession(binary)
+    sh.start()
+    try:
+        sh.send(CMD["format"].format(image=image, size=size_mb * 1024 * 1024))
+        sh.send(CMD["mount"].format(image=image))
+        sh.send(CMD["create"].format(path="/tree.bin"))
+        out = sh.send(CMD["open"].format(path="/tree.bin", mode="rdwr"))
+        fd = extract_fd(out)
+        if fd is None:
+            fd = 0
+
+        boundaries = [
+            (5119, "D>", "direct -> single indirect"),
+            (70655, "S>", "single -> double indirect"),
+            (8459263, "T>", "double -> triple indirect"),
+        ]
+
+        for last_byte, marker, label in boundaries:
+            sh.send(CMD["seek"].format(fd=fd, offset=last_byte, whence="set"), log=False)
+            sh.send(CMD["write"].format(fd=fd, data=marker), log=False)
+            info(f"wrote marker '{marker}' at offset {last_byte} ({label})")
+
+        expected_size = boundaries[-1][0] + 2
+        out = sh.send(CMD["stat"].format(path="/tree.bin"))
+        m = SIZE_RE.search(out)
+        reported = int(m.group(1)) if m else -1
+        rpt.check(reported == expected_size,
+                   f"file size reflects triple-indirect write (expected {expected_size}, got {reported})")
+
+        for last_byte, marker, label in boundaries:
+            sh.send(CMD["seek"].format(fd=fd, offset=last_byte, whence="set"), log=False)
+            out = sh.send(CMD["read"].format(fd=fd, size=2), log=False)
+            rpt.check(marker in out, f"read-back marker intact at {label} boundary (offset {last_byte})")
+
+        out = sh.send(CMD["fsck"])
+        fsck_ok = ("clean" in out.lower() or "no errors" in out.lower()) and "error:" not in out.lower()
+        rpt.check(fsck_ok, "fsck reports consistent bitmap across all four tiers")
+
+        sh.send(CMD["close"].format(fd=fd))
+        sh.send(CMD["unmount"])
+    finally:
+        sh.close()
+    return rpt.finalize()
+
+
+def scenario_unlink_large_file(binary: str, image: str, size_mb: int = 20) -> bool:
+    header("SCENARIO: UNLINK ON A DOUBLE-INDIRECT FILE (post-fix)")
+    fresh_image(image)
+    rpt = Report("unlink_large_file")
+    sh = ShellSession(binary)
+    sh.start()
+    try:
+        sh.send(CMD["format"].format(image=image, size=size_mb * 1024 * 1024))
+        sh.send(CMD["mount"].format(image=image))
+        sh.send(CMD["create"].format(path="/big.bin"))
+        out = sh.send(CMD["open"].format(path="/big.bin", mode="rdwr"))
+        fd = extract_fd(out)
+        if fd is None:
+            fd = 0
+
+        sh.send(CMD["seek"].format(fd=fd, offset=70656, whence="set"), log=False)
+        sh.send(CMD["write"].format(fd=fd, data="X"), log=False)
+        sh.send(CMD["close"].format(fd=fd))
+
+        out = sh.send(CMD["unlink"].format(path="/big.bin"))
+        rpt.check(not ERROR_RE.search(out),
+                   "unlink succeeds directly on a double-indirect file (no truncate-first workaround needed)")
+
+        out = sh.send(CMD["listdir"].format(path="/"))
+        rpt.check("big.bin" not in out, "listdir no longer shows the unlinked file")
+
+        out = sh.send(CMD["fsck"])
+        fsck_ok = ("clean" in out.lower() or "no errors" in out.lower()) and "error:" not in out.lower()
+        rpt.check(fsck_ok, "fsck reports clean immediately after unlink")
+
+        sh.send(CMD["unmount"])
+    finally:
+        sh.close()
+    return rpt.finalize()
+
+
+def scenario_journal_large_txn(binary: str, image: str, size_mb: int = 8) -> bool:
+    header("SCENARIO: JOURNAL BATCHING FOR LARGE TRANSACTIONS (post-fix)")
+    fresh_image(image)
+    rpt = Report("journal_large_txn")
+    sh = ShellSession(binary)
+    sh.start()
+    try:
+        sh.send(CMD["format"].format(image=image, size=size_mb * 1024 * 1024))
+        sh.send(CMD["mount"].format(image=image))
+        sh.send(CMD["create"].format(path="/big_txn.bin"))
+
+        # 80 new blocks in one truncate call: exceeds the old 50-pair
+        # journal window that used to leave the tail unjournaled.
+        target_size = 80 * UFS_BLOCK_SIZE + 1
+        out = sh.send(CMD["truncate"].format(path="/big_txn.bin", size=target_size))
+        rpt.check(not ERROR_RE.search(out), "truncate growth spanning >50 blocks in one txn succeeds")
+
+        out = sh.send(CMD["stat"].format(path="/big_txn.bin"))
+        m = SIZE_RE.search(out)
+        reported = int(m.group(1)) if m else -1
+        rpt.check(reported == target_size, f"size correctly reflects growth ({reported})")
+
+        out = sh.send(CMD["fsck"])
+        fsck_ok = ("clean" in out.lower() or "no errors" in out.lower()) and "error:" not in out.lower()
+        rpt.check(fsck_ok, "fsck reports clean (every applied block was journaled in batches)")
+
+        sh.send(CMD["unmount"])
+    finally:
+        sh.close()
+    return rpt.finalize()
+
+
+def scenario_journal_txn_abort_no_leak(binary: str, image: str, size_mb: int = 8) -> bool:
+    header("SCENARIO: ABORTED TXN LEAVES NO ORPHANED BLOCKS (post-fix)")
+    fresh_image(image)
+    rpt = Report("journal_txn_abort_no_leak")
+    sh = ShellSession(binary)
+    sh.start()
+    try:
+        sh.send(CMD["format"].format(image=image, size=size_mb * 1024 * 1024))
+        sh.send(CMD["mount"].format(image=image))
+        sh.send(CMD["create"].format(path="/aborted.bin"))
+
+        # >128 new blocks in one call still hits MAX_TXN_BLOCKS and aborts,
+        # but the rollback now frees every block ufs_bmap() allocated
+        # before the abort -- no leak, no fsck repair needed.
+        target_size = 200 * UFS_BLOCK_SIZE + 1
+        out = sh.send(CMD["truncate"].format(path="/aborted.bin", size=target_size))
+        rpt.check(bool(ERROR_RE.search(out)), "oversized truncate (>MAX_TXN_BLOCKS) is still rejected")
+
+        out = sh.send(CMD["stat"].format(path="/aborted.bin"))
+        m = SIZE_RE.search(out)
+        reported = int(m.group(1)) if m else -1
+        rpt.check(reported == 0, f"aborted truncate leaves size unchanged at 0 (got {reported})")
+
+        sh.send(CMD["unmount"])
+    finally:
+        sh.close()
+
+    sb = verify_superblock_layout(image)
+    free_before = free_block_count(image, sb)
+    info(f"free blocks immediately after abort (no fsck run yet): {free_before}")
+
+    sh2 = ShellSession(binary)
+    sh2.start()
+    try:
+        sh2.send(CMD["mount"].format(image=image))
+        out = sh2.send(CMD["fsck"])
+        rpt.check("clean" in out.lower() or "no errors" in out.lower(),
+                   "fsck finds nothing to repair -- rollback already freed the blocks")
+        sh2.send(CMD["unmount"])
+    finally:
+        sh2.close()
+
+    free_after = free_block_count(image, sb)
+    rpt.check(free_after == free_before, f"free block count unchanged by fsck ({free_before} == {free_after})")
+
+    return rpt.finalize()
+
+
+def scenario_journal_replay_crafted(binary: str, image: str, size_mb: int = 4) -> bool:
+    header("SCENARIO: HAND-CRAFTED PENDING JOURNAL RECORD -> MOUNT-TIME REPLAY")
+    fresh_image(image)
+    rpt = Report("journal_replay_crafted")
+    sh = ShellSession(binary)
+    sh.start()
+    try:
+        sh.send(CMD["format"].format(image=image, size=size_mb * 1024 * 1024))
+        sh.send(CMD["mount"].format(image=image))
+        sh.send(CMD["create"].format(path="/target.bin"))
+        out = sh.send(CMD["open"].format(path="/target.bin", mode="rdwr"))
+        fd = extract_fd(out)
+        if fd is None:
+            fd = 0
+        sh.send(CMD["seek"].format(fd=fd, offset=70656, whence="set"), log=False)
+        sh.send(CMD["write"].format(fd=fd, data="Z"), log=False)
+        sh.send(CMD["close"].format(fd=fd))
+        sh.send(CMD["unmount"])
+    finally:
+        sh.close()
+
+    sb = verify_superblock_layout(image)
+    inum = find_inum_by_name(image, sb, "target.bin")
+    rpt.check(inum is not None, "located target.bin's inode for raw inspection")
+
+    target_block = sb["data_start"] + 5
+    payload = (b"REPLAYED_BY_JOURNAL_" + os.urandom(8)).ljust(UFS_BLOCK_SIZE, b"\x00")
+    craft_journal_pair(image, sb, slot_index=0, target_block=target_block, payload=payload)
+    info(f"crafted a pending committed journal record targeting block {target_block}")
+
+    sh2 = ShellSession(binary)
+    sh2.start()
+    try:
+        out = sh2.send(CMD["mount"].format(image=image))
+        rpt.check(not ERROR_RE.search(out), "mount (with pending journal record) completes without error")
+        sh2.send(CMD["unmount"])
+    finally:
+        sh2.close()
+
+    on_disk = read_raw_block(image, target_block)
+    rpt.check(on_disk == payload, "target block reflects replayed journal payload after mount")
+
+    record_block = read_raw_block(image, sb["journal_start"] + 1)
+    magic_after = struct.unpack_from("<I", record_block, 0)[0]
+    rpt.check(magic_after != UFS_JOURNAL_MAGIC, "journal record cleared after replay (won't double-apply)")
+
+    before = read_raw_block(image, target_block)
+    sh3 = ShellSession(binary)
+    sh3.start()
+    try:
+        sh3.send(CMD["mount"].format(image=image))
+        sh3.send(CMD["unmount"])
+    finally:
+        sh3.close()
+    after = read_raw_block(image, target_block)
+    rpt.check(before == after, "re-mounting again is idempotent (no re-replay)")
+
+    return rpt.finalize()
+
+
+def scenario_corruption_indirect_gap(binary: str, image: str, size_mb: int = 4) -> bool:
+    header("SCENARIO: CRC COVERAGE GAP -- INDIRECT-TIER CORRUPTION (documented, unfixed)")
+    fresh_image(image)
+    rpt = Report("corruption_indirect_gap")
+    secret = "INDIRECT_TIER_SECRET_PAYLOAD"
+    sh = ShellSession(binary)
+    sh.start()
+    try:
+        sh.send(CMD["format"].format(image=image, size=size_mb * 1024 * 1024))
+        sh.send(CMD["mount"].format(image=image))
+        sh.send(CMD["create"].format(path="/indirect_secret.bin"))
+        out = sh.send(CMD["open"].format(path="/indirect_secret.bin", mode="rdwr"))
+        fd = extract_fd(out)
+        if fd is None:
+            fd = 0
+        sh.send(CMD["seek"].format(fd=fd, offset=6000, whence="set"), log=False)
+        sh.send(CMD["write"].format(fd=fd, data=secret), log=False)
+        sh.send(CMD["close"].format(fd=fd))
+        sh.send(CMD["unmount"])
+    finally:
+        sh.close()
+
+    corrupted = False
+    with open(image, "r+b") as f:
+        data = f.read()
+        idx = data.find(secret.encode())
+        rpt.check(idx != -1, "located secret payload in the indirect-tier data block")
+        if idx != -1:
+            f.seek(idx + len(secret) // 2)
+            b = f.read(1)
+            f.seek(idx + len(secret) // 2)
+            f.write(bytes([b[0] ^ 0xFF]))
+            corrupted = True
+    rpt.check(corrupted, "flipped one byte inside indirect-tier data")
+
+    sh2 = ShellSession(binary)
+    sh2.start()
+    try:
+        sh2.send(CMD["mount"].format(image=image))
+        out = sh2.send(CMD["open"].format(path="/indirect_secret.bin", mode="rdonly"))
+        fd = extract_fd(out)
+        if fd is None:
+            fd = 0
+        sh2.send(CMD["seek"].format(fd=fd, offset=6000, whence="set"), log=False)
+        out = sh2.send(CMD["read"].format(fd=fd, size=len(secret)))
+        rpt.check(secret not in out,
+                   "corrupted bytes ARE returned -- known gap: no CRC coverage past direct blocks "
+                   "(requires an on-disk format bump to fix; see write-up)")
+        sh2.send(CMD["unmount"])
+    finally:
+        sh2.close()
+    return rpt.finalize()
+
+
+def scenario_softdelete_expiry_purge(binary: str, image: str, size_mb: int = 2) -> bool:
+    header("SCENARIO: FORCED TRASH EXPIRY -> FSCK PURGE")
+    fresh_image(image)
+    rpt = Report("softdelete_expiry_purge")
+    sh = ShellSession(binary)
+    sh.start()
+    try:
+        sh.send(CMD["format"].format(image=image, size=size_mb * 1024 * 1024))
+        sh.send(CMD["mount"].format(image=image))
+        sh.send(CMD["create"].format(path="/doomed.txt"))
+        sh.send(CMD["unlink"].format(path="/doomed.txt"))
+        sh.send(CMD["unmount"])
+    finally:
+        sh.close()
+
+    sb = verify_superblock_layout(image)
+    inum = find_inum_by_name(image, sb, "doomed.txt")
+    rpt.check(inum is not None, "located trashed inode for /doomed.txt")
+
+    if inum is not None:
+        patch_inode_field(image, sb, inum, EXPIRY_TIME_OFFSET, "<q", 1)
+        info(f"patched inode {inum}'s expiry_time to the distant past")
+
+    sh2 = ShellSession(binary)
+    sh2.start()
+    try:
+        sh2.send(CMD["mount"].format(image=image))
+        out = sh2.send(CMD["fsck"])
+        rpt.check("purg" in out.lower(), "fsck reports purging the expired trashed file")
+        sh2.send(CMD["unmount"])
+    finally:
+        sh2.close()
+
+    with open(image, "rb") as f:
+        f.seek(inode_byte_offset(sb, inum))
+        raw = f.read(8)
+        used, _ = struct.unpack("<II", raw)
+    rpt.check(used == 0, "inode marked free after purge (reusable by future creates)")
+
+    return rpt.finalize()
+
+
+def scenario_tag_length_boundary(binary: str, image: str, size_mb: int = 1) -> bool:
+    header("SCENARIO: TAG LENGTH BOUNDARY (31 ok / 32 rejected)")
+    fresh_image(image)
+    rpt = Report("tag_length_boundary")
+    sh = ShellSession(binary)
+    sh.start()
+    try:
+        sh.send(CMD["format"].format(image=image, size=size_mb * 1024 * 1024))
+        sh.send(CMD["mount"].format(image=image))
+        sh.send(CMD["create"].format(path="/tagme.txt"))
+
+        out = sh.send(CMD["settag"].format(path="/tagme.txt", tag="A" * 31))
+        rpt.check(not ERROR_RE.search(out), "31-char tag accepted")
+
+        out = sh.send(CMD["settag"].format(path="/tagme.txt", tag="B" * 32))
+        rpt.check(bool(ERROR_RE.search(out)), "32-char tag rejected (ENAMETOOLONG)")
+
+        sh.send(CMD["unmount"])
+    finally:
+        sh.close()
+    return rpt.finalize()
+
+
+def scenario_dirent_slot_reuse(binary: str, image: str, size_mb: int = 2) -> bool:
+    header("SCENARIO: DIRECTORY DIRENT SLOT REUSE AFTER DELETE")
+    fresh_image(image)
+    rpt = Report("dirent_slot_reuse")
+    sh = ShellSession(binary)
+    sh.start()
+    try:
+        sh.send(CMD["format"].format(image=image, size=size_mb * 1024 * 1024))
+        sh.send(CMD["mount"].format(image=image))
+        sh.send(CMD["mkdir"].format(path="/full"))
+
+        capacity = 120  # 10 direct blocks * (512 / sizeof(ufs_disk_dirent)=40) = 120
+        for i in range(capacity):
+            sh.send(CMD["create"].format(path=f"/full/f{i:04d}"), timeout=1.0, log=False)
+
+        out = sh.send(CMD["create"].format(path="/full/overflow"))
+        rpt.check(bool(ERROR_RE.search(out)), f"directory at capacity ({capacity}) rejects a new entry")
+
+        out = sh.send(CMD["unlink"].format(path="/full/f0000"))
+        rpt.check(not ERROR_RE.search(out), "freed one dirent slot via unlink")
+
+        out = sh.send(CMD["create"].format(path="/full/reused"))
+        rpt.check(not ERROR_RE.search(out), "new create succeeds by reusing the freed dirent slot")
+
+        sh.send(CMD["unmount"])
+    finally:
+        sh.close()
+    return rpt.finalize()
+
+
 SCENARIOS = {
     "progressive": scenario_progressive,
     "stress": scenario_stress,
     "corruption": scenario_corruption,
     "tagging": scenario_tagging,
     "softdelete": scenario_softdelete,
-    "seek_truncate": scenario_seek_truncate,    
-    "dir_robustness": scenario_dir_robustness, 
+    "seek_truncate": scenario_seek_truncate,
+    "dir_robustness": scenario_dir_robustness,
     "fd_exhaustion": scenario_fd_exhaustion,
     "indirect_blocks": scenario_indirect_blocks,
 
+    # --- advanced scenarios (indirect boundaries / journal / crc / trash) ---
+    "boundary_crossing_writes": scenario_boundary_crossing_writes,
+    "unlink_large_file": scenario_unlink_large_file,
+    "journal_large_txn": scenario_journal_large_txn,
+    "journal_txn_abort_no_leak": scenario_journal_txn_abort_no_leak,
+    "journal_replay_crafted": scenario_journal_replay_crafted,
+    "corruption_indirect_gap": scenario_corruption_indirect_gap,
+    "softdelete_expiry_purge": scenario_softdelete_expiry_purge,
+    "tag_length_boundary": scenario_tag_length_boundary,
+    "dirent_slot_reuse": scenario_dirent_slot_reuse,
 }
 
 def main():
